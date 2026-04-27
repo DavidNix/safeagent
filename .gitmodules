@@ -13,3 +13,6 @@
 [submodule "zeroclaw"]
 	path = zeroclaw
 	url = https://github.com/zeroclaw-labs/zeroclaw
+[submodule "opencode"]
+	path = opencode
+	url = https://github.com/anomalyco/opencode
