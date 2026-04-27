@@ -1,0 +1,15 @@
+[submodule "openclaw"]
+	path = openclaw
+	url = https://github.com/openclaw/openclaw
+[submodule "claude-code"]
+	path = claude-code
+	url = https://github.com/DavidNix/claude-code
+[submodule "pi-mono"]
+	path = pi-mono
+	url = https://github.com/badlogic/pi-mono
+[submodule "hermes-agent"]
+	path = hermes-agent
+	url = https://github.com/nousresearch/hermes-agent
+[submodule "zeroclaw"]
+	path = zeroclaw
+	url = https://github.com/zeroclaw-labs/zeroclaw
