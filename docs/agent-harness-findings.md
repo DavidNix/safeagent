@@ -350,6 +350,124 @@ The tool layer should enforce these rules:
 
 For Lite, start with sequential execution. Add safe parallelism later for `read_file`, `glob`, and `grep`.
 
+## Subagents And Delegation
+
+Subagents are model-visible delegation: the parent model calls a tool that starts another agent loop with its own prompt, session state, tool permissions, and result channel. The mature systems treat this as a second run, not as a special provider feature.
+
+The common delegation flow is:
+
+```text
+parent model calls delegate/task/subagent tool
+validate requested agent type and task prompt
+check depth, concurrency, permission, and workspace policy
+create or resume child session/run
+select child model, system prompt, tools, and permission mode
+choose context mode: isolated, inherited, forked, or summarized
+run the normal agent loop for the child
+persist child transcript and task status
+return concise result, error, or resumable task_id to parent
+```
+
+Repository patterns:
+
+| Repo | Subagent Pattern | Useful Files |
+| --- | --- | --- |
+| `openclaw` | `sessions_spawn` starts direct or ACP-backed subagent runs, tracks child sessions, supports isolated and forked context, enforces spawn depth and active-child limits, and exposes list/kill/steer control | `src/agents/tools/sessions-spawn-tool.ts`, `src/agents/subagent-spawn.ts`, `src/agents/subagent-registry.types.ts`, `src/agents/subagent-control.ts` |
+| `claude-code` | `AgentTool` delegates to typed agent definitions, supports foreground and background agents, worktree isolation, forked context, teammate/swarm paths, and runs the normal `query()` loop in a side transcript | `tools/AgentTool/AgentTool.tsx`, `tools/AgentTool/runAgent.ts`, `tools/AgentTool/forkSubagent.ts`, `tools/AgentTool/loadAgentsDir.ts`, `utils/swarm/spawnInProcess.ts` |
+| `pi-mono` | Core coding agent intentionally skips subagents; the example extension registers a `subagent` tool that spawns separate `pi` processes in single, parallel, or chain mode | `packages/coding-agent/README.md`, `packages/coding-agent/examples/extensions/subagent/index.ts` |
+| `hermes-agent` | `delegate_task` creates child `AIAgent` instances with isolated context, restricted or inherited toolsets, leaf/orchestrator roles, depth controls, batch parallelism, and TUI events | `tools/delegate_tool.py`, `toolsets.py`, `tui_gateway/server.py` |
+| `zeroclaw` | `DelegateTool` delegates to configured agents in sync, background, parallel, or agentic tool-loop mode; `SwarmTool` orchestrates multiple configured agents | `crates/zeroclaw-runtime/src/tools/delegate.rs`, `crates/zeroclaw-tools/src/swarm.rs`, `crates/zeroclaw-config/src/schema.rs` |
+| `opencode` | `TaskTool` creates or resumes child sessions for agents configured with `mode: "subagent"`, returns a resumable `task_id`, and applies per-subagent permission rules | `packages/opencode/src/tool/task.ts`, `packages/opencode/src/tool/registry.ts`, `packages/opencode/src/session/prompt.ts`, `packages/opencode/src/config/agent.ts` |
+
+Best practices for subagents:
+
+1. Treat each subagent as a normal agent run with its own session ID, run ID, transcript, prompt, and tool registry.
+2. Pass only the minimum context the child needs. Prefer isolated or summarized context over full parent transcript inheritance.
+3. Enforce max depth and max active children in code.
+4. Make child toolsets narrower than parent toolsets by default.
+5. Require explicit permission for workspace mutation, network access, shell access, or high-risk tools in child runs.
+6. Return a concise child summary to the parent and keep the full child transcript in durable storage.
+7. Make background subagents resumable through a `task_id` or run ID.
+8. Propagate cancellation from parent to child.
+9. Record parent-child relationships in telemetry and audit logs.
+10. Avoid letting a child subagent silently escalate model, tool, or permission settings.
+
+Recommended Lite stance:
+
+1. Exclude subagents from the first version.
+2. Keep a future seam for `AgentInvoker`, but do not expose it as a model tool yet.
+3. Do not add background subagents until the single-agent loop, cancellation, session storage, and policy system are stable.
+4. If delegation is added later, implement it as a child `Lite.Run` with a separate session and a narrower tool registry.
+
+Possible future interface:
+
+```go
+type AgentInvoker interface {
+    InvokeAgent(ctx context.Context, req AgentInvokeRequest) (*AgentInvokeResult, error)
+    CancelAgent(ctx context.Context, runID string) error
+}
+
+type AgentInvokeRequest struct {
+    ParentSessionID string
+    AgentType       string
+    Task            string
+    ContextMode     string
+    ToolAllowlist   []string
+    MaxSteps        int
+}
+```
+
+## Task Spawning And Background Runs
+
+Task handling appears in two forms. Model-visible task tools ask another agent or worker to do work. Internal task systems serialize runs, queue user follow-ups, drain delivery queues, cancel streams, and track background state. The second form is needed even when Lite has no subagents.
+
+Common internal task lifecycle:
+
+```text
+create run or queue item
+mark queued or running
+attach abort controller or cancellation token
+serialize by session or resource key
+execute model/tool work
+record progress events
+persist final status: succeeded, failed, cancelled, timed out
+notify session or caller
+clean up leases, temp files, and background handles
+```
+
+Repository patterns:
+
+| Repo | Task/Background Pattern | Useful Files |
+| --- | --- | --- |
+| `openclaw` | Detached task registry tracks runtimes such as `subagent`, `acp`, `cli`, and `cron`; task executor records queued/running/final state; delivery queue recovery uses retry and in-progress guards | `src/tasks/task-registry.types.ts`, `src/tasks/task-executor.ts`, `src/tasks/detached-task-runtime.ts`, `src/tasks/task-registry.ts`, `src/infra/session-delivery-queue-recovery.ts` |
+| `claude-code` | Background agents register `LocalAgentTask` state with `AbortController`; command queue uses priorities; queue processor drains when no query is active; task notifications re-enter the main loop | `tasks/LocalAgentTask/LocalAgentTask.tsx`, `utils/messageQueueManager.ts`, `utils/queueProcessor.ts`, `hooks/useQueueProcessor.ts` |
+| `pi-mono` | `AgentSession.prompt()` serializes active streaming; follow-up and steering messages queue instead of starting concurrent turns; file mutation queue serializes writes per real path | `packages/coding-agent/src/core/agent-session.ts`, `packages/coding-agent/src/core/tools/file-mutation-queue.ts`, `packages/coding-agent/src/core/agent-session-runtime.ts` |
+| `hermes-agent` | Gateway tracks running agents, pending messages, FIFO queues, queued events, and asyncio background tasks; delegate tool runs child agents through thread pools with timeout and interrupt support | `gateway/run.py`, `gateway/stream_consumer.py`, `tools/delegate_tool.py` |
+| `zeroclaw` | Session actor queue uses a one-per-session semaphore; delegate tool writes background result files, spawns Tokio tasks, and uses cancellation tokens | `crates/zeroclaw-gateway/src/session_queue.rs`, `crates/zeroclaw-runtime/src/tools/delegate.rs` |
+| `opencode` | `SessionRunState` serializes active runs per session; `Runner.ensureRunning` gates concurrent prompts; task tool cancellation calls back into session prompt ops; utilities provide async queues and locks | `packages/opencode/src/session/run-state.ts`, `packages/opencode/src/session/prompt.ts`, `packages/opencode/src/tool/task.ts`, `packages/opencode/src/util/queue.ts`, `packages/opencode/src/util/lock.ts` |
+
+Best practices for task handling:
+
+1. Allow only one active model run per session unless the system has explicit child sessions.
+2. Use run IDs and statuses for all long-running work.
+3. Separate queued user follow-ups from currently executing model turns.
+4. Propagate cancellation through provider streams, tool execution, file locks, and child tasks.
+5. Serialize mutations by resource key, usually file path or session ID.
+6. Bound queue depth and return a clear busy or queued response.
+7. Persist task state before starting work so crashes do not erase in-flight runs.
+8. Store large task output out of context and return a concise reference.
+9. Notify the model or user when background work finishes, but avoid unbounded automatic re-entry.
+10. Make non-interactive cancellation and timeout behavior deterministic.
+
+Recommended Lite stance:
+
+1. Implement one active run per session from the beginning.
+2. Add `RunID`, `Status`, `StartedAt`, `EndedAt`, and `Cancel` to the session store or runner state.
+3. Support cancellation with `context.Context` before adding any queue.
+4. Reject concurrent prompts for the same session at first, or queue one explicit follow-up with a bounded depth.
+5. Serialize file mutations by canonical path if `apply_patch` or `write_file` is enabled.
+6. Do not add detached/background work until foreground runs are durable and cancellable.
+
 ## Provider API Design
 
 The Go harness should hide provider differences behind a small interface:
@@ -386,58 +504,640 @@ The internal event model should support:
 
 Native tool providers should map directly into this event model. Non-native or text-based tool calling should be handled by a dispatcher outside the core loop.
 
-## System Prompt Best Practices
+## System Prompt Best Practices And Commonalities
 
-The strongest systems share these prompt habits:
+The mature harnesses treat the system prompt as a versioned runtime artifact. It is assembled from ordered sections, split into stable and dynamic parts, cached or hashed, and combined with runtime policy that enforces the rules in code.
 
-1. Keep a stable base prompt with deterministic section order.
-2. Separate stable prompt content from dynamic runtime content.
-3. Put tool usage rules near the tool descriptions.
-4. Include explicit tool honesty rules: do not claim a tool was used if it was not.
-5. Include autonomy rules that encourage action, but do not override safety gates.
-6. Include workspace rules, path rules, and verification expectations.
-7. Include current date, cwd, platform, and model only in a dynamic section.
-8. Keep user, project, and memory context clearly fenced.
-9. Do not rely on prompts to enforce security.
-10. Track a digest of the final system prompt and tool schema set.
+Repository patterns:
+
+| Repo | Prompt Pattern | Useful Files |
+| --- | --- | --- |
+| `openclaw` | `buildAgentSystemPrompt` inserts stable context before an explicit cache boundary and dynamic additions after it; context files and capability IDs are sorted for stable ordering | `src/agents/system-prompt.ts`, `src/agents/system-prompt-cache-boundary.ts`, `src/agents/pi-embedded-runner/system-prompt.ts` |
+| `claude-code` | `getSystemPrompt` and `buildEffectiveSystemPrompt` split stable and dynamic sections, use section-level cache controls, and load managed/user/project instructions through a precedence model | `constants/prompts.ts`, `utils/systemPrompt.ts`, `constants/systemPromptSections.ts`, `utils/api.ts`, `utils/markdownConfigLoader.ts` |
+| `pi-mono` | `buildSystemPrompt` creates a compact coding-agent prompt; session rebuilds the base prompt when active tools change; project context loads `AGENTS.md` and `CLAUDE.md` from agent and ancestor directories | `packages/coding-agent/src/core/system-prompt.ts`, `packages/coding-agent/src/core/agent-session.ts`, `packages/coding-agent/src/core/resource-loader.ts` |
+| `hermes-agent` | `_build_system_prompt` builds and reuses a session-stable prompt; ephemeral context is appended at API-call time; prompt builder scans and truncates context files | `run_agent.py`, `agent/prompt_builder.py`, `agent/prompt_caching.py`, `website/docs/developer-guide/prompt-assembly.md` |
+| `zeroclaw` | System prompt builder composes identity, safety, tools, autonomy, and workspace sections; prompt guard scans risky inputs; bootstrap files are bounded | `crates/zeroclaw-runtime/src/agent/system_prompt.rs`, `crates/zeroclaw-runtime/src/agent/prompt.rs`, `crates/zeroclaw-runtime/src/security/prompt_guard.rs` |
+| `opencode` | Final system message combines provider/model prompt, environment, skills, custom system text, per-user system text, plugin transforms, and resolved instruction files | `packages/opencode/src/session/system.ts`, `packages/opencode/src/session/prompt.ts`, `packages/opencode/src/session/llm.ts`, `packages/opencode/src/session/instruction.ts` |
+
+Common prompt layers:
+
+| Layer | Stable Or Dynamic | Purpose |
+| --- | --- | --- |
+| Identity and role | Stable | Define the agent's job, tone, and operating domain |
+| Safety and authority | Stable | State instruction hierarchy, workspace boundaries, approval expectations, and forbidden behavior |
+| Tool-use rules | Stable | Explain when to use tools, how to report tool use, and how to handle failures |
+| Tool schemas | Stable per session | Give provider-native tool definitions or prompt-format tool descriptions |
+| Autonomy rules | Stable | Encourage persistence, investigation, verification, and completion within policy limits |
+| Project instructions | Stable or semi-stable | Include trusted project files such as `AGENTS.md`, `CLAUDE.md`, or repo-specific docs |
+| Runtime environment | Dynamic | Add cwd, platform, date, model, sandbox, and permission mode |
+| User/session context | Dynamic | Add current request, selected files, memory snippets, todos, and recent state |
+| Response style | Stable | Keep answers concise, direct, and CLI-friendly |
+
+Best practices:
+
+1. Keep stable identity, safety, tool rules, and project instructions at the start of the prompt.
+2. Put date, cwd, model, active session state, and ephemeral reminders after the stable cache boundary.
+3. Make cache boundaries explicit in the prompt builder, not implicit in string concatenation.
+4. Sort and dedupe tools, capabilities, skills, and context files before insertion.
+5. Apply provider cache metadata as an overlay. Do not mutate the canonical prompt or tool schemas.
+6. Fence project instructions and label their source paths.
+7. Treat project instructions, memory, and retrieved context as lower priority than harness rules.
+8. Scan or bound project context for prompt-injection patterns, but enforce security in runtime policy.
+9. Include tool honesty rules: do not claim to have read, edited, tested, or run anything unless a tool actually did it.
+10. Include explicit tool-result handling: report errors, do not hide failed tools, and continue only when safe.
+11. Include autonomy rules that promote action, but never let them override approval or workspace limits.
+12. Include verification expectations, especially after code edits.
+13. Keep response-style rules short and below safety/tool rules.
+14. Hash the final stable system prefix and tool schema set for cache diagnostics and replay.
+15. Version the prompt so evals and trace replay can explain behavior changes.
 
 Recommended Lite prompt structure:
 
 ```text
+[stable]
 1. Identity and role
-2. Safety and workspace rules
-3. Agent loop and tool-use rules
-4. Available tools and when to use them
-5. Editing rules if mutation tools are enabled
-6. Response style
-7. Dynamic runtime context: cwd, date, platform, model
-8. Optional project instructions from trusted files
+2. Instruction hierarchy and safety rules
+3. Workspace and file-access rules
+4. Agent loop and tool-use rules
+5. Tool honesty and verification rules
+6. Available tools and mutation policy
+7. Response style
+8. Optional project instructions, fenced and source-labeled
+<!-- SAFEAGENT_CACHE_BOUNDARY -->
+
+[dynamic]
+9. Current date, cwd, platform, provider, model
+10. Session status, run ID, permission mode
+11. Current user request and explicit attachments
+12. Optional memory or retrieved context, fenced as informational
 ```
 
-Lite should load project instruction files only after path validation and size limits. It should scan or fence these files as untrusted instructions below the harness-level system rules.
+Lite should load project instruction files only after path validation and size limits. It should treat those files as untrusted project context below the harness-level system rules. The prompt can tell the model not to exfiltrate secrets or escape the workspace, but tool implementations must enforce those controls.
 
 ## Prompt Caching
 
-Prompt caching is a production optimization, but it affects architecture early.
+Prompt caching is mostly provider-side. The provider must implement cache storage, prefix matching, KV reuse, TTL, billing discounts, and usage reporting. The harness still matters because it determines whether requests are cacheable.
 
-Common patterns:
+The harness should keep stable content at the beginning of the request, place provider-specific cache markers or keys, preserve byte-identical prompt and tool schema prefixes, and measure cache hit rates. Prompt caching is not response caching; the provider still generates new output.
 
-1. Stable system prompt prefix.
-2. Stable tool schema order.
-3. Stable cache-control placement.
-4. Session-latched cache options.
-5. Last-message or recent-message cache markers where providers support them.
-6. Prompt and tool digest logging to diagnose cache breaks.
+### Cache Types
 
-Lite should not depend on prompt caching in v1, but it should be cache-ready:
+| Cache Type | Implemented By | What It Reuses | Lite Recommendation |
+| --- | --- | --- | --- |
+| Prompt/KV cache | LLM provider | Repeated prompt prefix, often attention KV tensors | Use through provider APIs |
+| Explicit context cache | Some providers, especially Gemini/Vertex | Named cached content resource | Defer until lifecycle is needed |
+| Application response cache | Harness | Final response for identical request | Avoid initially for agent loops |
 
-1. Sort system sections deterministically.
-2. Sort tool schemas by tool name.
-3. Avoid random IDs in prompts.
-4. Avoid timestamps in the stable system prefix.
-5. Keep dynamic context in a separate section.
-6. Compute and log `system_prompt_sha256` and `tool_schema_sha256` per request.
-7. Preserve provider usage fields for cache read and write tokens.
+### Provider API Summary
+
+| Provider | Main Mechanism | Harness Control | Usage Fields |
+| --- | --- | --- | --- |
+| Anthropic Claude | `cache_control` on request or content blocks | Explicit breakpoints, 5m default TTL, optional 1h TTL | `cache_creation_input_tokens`, `cache_read_input_tokens` |
+| OpenAI | Automatic prefix caching | Stable prefix, `prompt_cache_key`, `prompt_cache_retention` where supported | `cached_tokens` in token details |
+| Google Gemini / Vertex AI | Implicit caching plus explicit context cache resources | Stable prefix for implicit; create/use/update/delete cache resources for explicit | `cachedContentTokenCount` |
+| Amazon Bedrock | `cachePoint` in Converse, `cache_control` for Claude InvokeModel | Explicit checkpoints, TTL where supported | `CacheReadInputTokens`, `CacheWriteInputTokens` |
+| OpenRouter and proxies | Provider-dependent | Anthropic-style markers or OpenAI-style keys only when capability-gated | Varies |
+
+### Anthropic
+
+Anthropic supports automatic caching and explicit cache breakpoints.
+
+Important behavior:
+
+1. Cached prefix order is `tools`, then `system`, then `messages`.
+2. Cache hits require exact matching content up to the cache breakpoint.
+3. Default TTL is 5 minutes.
+4. Optional 1-hour TTL is available at higher write cost.
+5. Cache read tokens are much cheaper than normal input tokens.
+6. Cache write tokens cost more than normal input tokens.
+7. Caching only works above model-specific minimum token thresholds.
+8. Explicit block-level caching supports up to 4 breakpoints.
+9. Anthropic can look back roughly 20 content blocks from a breakpoint to find a prior cache entry.
+10. Tool definitions, system blocks, messages, images, tool uses, and tool results can be cached.
+
+Harness implications:
+
+1. Put tool schemas first and keep their order stable.
+2. Put stable system prompt content before dynamic runtime content.
+3. Put `cache_control` on the last stable block, not on a timestamp or current user message unless using automatic conversation caching deliberately.
+4. Do not add cache markers to thinking blocks.
+5. Track `cache_creation_input_tokens` and `cache_read_input_tokens`.
+6. Avoid random JSON key order in tool calls and tool schemas.
+
+Short retention marker:
+
+```json
+{ "cache_control": { "type": "ephemeral" } }
+```
+
+Long retention marker:
+
+```json
+{ "cache_control": { "type": "ephemeral", "ttl": "1h" } }
+```
+
+### OpenAI
+
+OpenAI prompt caching is automatic for recent models and prompts of at least 1024 tokens. There is no Anthropic-style block-level `cache_control` for direct OpenAI APIs.
+
+Important behavior:
+
+1. Caching works on exact prefix matches.
+2. Static content should be at the beginning of the request.
+3. Dynamic user-specific content should be at the end.
+4. `prompt_cache_key` can improve routing for shared prefixes.
+5. `prompt_cache_retention` can request in-memory or extended retention where supported.
+6. OpenAI reports cache hits through `cached_tokens` in usage details.
+7. Prompt caching does not change output generation.
+8. Cached prompts still count toward rate limits according to OpenAI docs.
+
+Harness implications:
+
+1. Build OpenAI requests with stable prefix order.
+2. Use `prompt_cache_key` derived from a stable session or stable prompt family.
+3. Do not generate a new cache key on every request.
+4. Use retention controls only when supported by the selected endpoint and model.
+5. Log `cached_tokens` and compute cache hit percentage.
+
+Recommended Lite behavior:
+
+```go
+PromptCacheKey := stableSessionID
+PromptCacheRetention := "in_memory" // or "24h" only when supported and desired
+```
+
+### Gemini / Vertex AI
+
+Vertex AI offers implicit and explicit context caching.
+
+Important behavior:
+
+1. Implicit caching is automatic for supported Gemini models.
+2. Implicit caching rewards large common prompt prefixes sent close together in time.
+3. Explicit caching requires creating a context cache resource.
+4. Explicit caches can be used, updated, inspected, and deleted through the API.
+5. Explicit caches have storage costs based on lifetime.
+6. `cachedContentTokenCount` reports cached token count.
+
+Harness implications:
+
+1. Start with implicit caching only.
+2. Normalize and log `cachedContentTokenCount` as cache read tokens.
+3. Do not implement explicit context cache resources until the harness owns session lifecycle, cleanup, and TTL refresh semantics.
+4. Consider explicit context caching later for large project context, documentation bundles, or long-lived read-only corpora.
+
+### Amazon Bedrock
+
+Bedrock supports prompt caching through explicit cache checkpoints for supported models and APIs.
+
+Important behavior:
+
+1. Bedrock uses cache checkpoints to define prompt prefixes.
+2. Converse APIs use `cachePoint`.
+3. Claude InvokeModel-style payloads can use Anthropic `cache_control`.
+4. Cache checkpoints require model-specific minimum token counts.
+5. Many Claude models allow up to 4 checkpoints.
+6. TTL is commonly 5 minutes, with 1-hour TTL on supported Claude models.
+7. Bedrock reports cache read and write token counts.
+8. Claude on Bedrock has simplified cache management with lookback near a specified breakpoint.
+
+Harness implications:
+
+1. Add `cachePoint` after stable system content, stable tool definitions, or a stable message prefix.
+2. Capability-gate by provider, model, endpoint, and region.
+3. Avoid cache checkpoints below token minimums because they silently fail to create useful cache entries.
+4. Normalize Bedrock cache usage into common usage buckets.
+
+### Proxies
+
+Proxy support varies. Some routes accept Anthropic-compatible `cache_control`; some OpenAI-compatible routes accept `prompt_cache_key`; some ignore or reject unsupported fields.
+
+Harness rules:
+
+1. Never blindly send provider-specific cache fields to unknown proxies.
+2. Add provider capability flags such as `SupportsAnthropicCacheControl`, `SupportsPromptCacheKey`, and `SupportsLongCacheRetention`.
+3. Default to provider-automatic behavior when compatibility is unknown.
+4. Parse usage fields defensively because proxies may return Anthropic, OpenAI, or custom cache metrics.
+
+### Submodule Lessons
+
+| Repo | Prompt Caching Pattern |
+| --- | --- |
+| `claude-code` | Strongest cache stability system: session-latched TTL, split system blocks, exactly one Anthropic message marker, cached base tool schemas, cache-break detection |
+| `openclaw` | Explicit system prompt cache boundary, proxy safety rules, prompt/tool digest observability |
+| `pi-mono` | Clean provider-neutral `cacheRetention` and `sessionId` options across Anthropic, OpenAI, Bedrock, and Google usage accounting |
+| `hermes-agent` | Practical Anthropic strategy: system prompt plus last three non-system messages, stored system prompt reuse, whitespace/tool JSON normalization |
+| `zeroclaw` | Provider capability flag and cached-token usage field, partial Anthropic and Bedrock marker support |
+| `opencode` | Provider transform layer marks first two system messages and last two non-system messages, with provider-specific option shapes |
+
+### Lite Cache Design
+
+Add cache policy as a first-class part of model request assembly.
+
+```go
+type CacheRetention string
+
+const (
+    CacheRetentionNone  CacheRetention = "none"
+    CacheRetentionShort CacheRetention = "short"
+    CacheRetentionLong  CacheRetention = "long"
+)
+
+type CachePolicy struct {
+    Enabled   bool
+    Retention CacheRetention
+    SessionID string
+}
+
+type CacheCapabilities struct {
+    Automatic             bool
+    AnthropicCacheControl bool
+    OpenAIPromptCacheKey  bool
+    OpenAIRetention       bool
+    BedrockCachePoint     bool
+    GeminiExplicitContext bool
+    LongRetention         bool
+}
+```
+
+Normalize usage:
+
+```go
+type Usage struct {
+    InputFreshTokens int64
+    CacheReadTokens  int64
+    CacheWriteTokens int64
+    OutputTokens     int64
+    TotalTokens      int64
+}
+```
+
+Track cache diagnostics:
+
+```go
+type CacheDiagnostics struct {
+    Enabled          bool
+    ProviderMode     string
+    Retention        CacheRetention
+    SessionID        string
+    SystemDigest     string
+    ToolSchemaDigest string
+    RequestDigest    string
+    CacheReadTokens  int64
+    CacheWriteTokens int64
+    SuspectedBreak   string
+}
+```
+
+Recommended stable prompt layout:
+
+```text
+[stable]
+1. Harness identity and safety rules
+2. Tool-use rules
+3. Tool schema descriptions, if provider serializes them here
+4. Project-level instructions that are stable for this session
+<!-- SAFEAGENT_CACHE_BOUNDARY -->
+
+[dynamic]
+5. Current date
+6. Current cwd
+7. Model/provider/runtime information
+8. Current user message and recent ephemeral context
+```
+
+Stable tool schema rules:
+
+1. Sort tools by name.
+2. Serialize JSON schema with sorted keys.
+3. Do not include runtime-only values in tool descriptions.
+4. Do not include timestamps, random IDs, absolute temp paths, or feature flags in schema text.
+5. Keep a session-stable copy of base tool schemas.
+6. Apply provider cache metadata as an overlay, not by mutating the base schema.
+
+Cache-affecting state should be latched when a session starts:
+
+1. Provider and model.
+2. Cache retention mode.
+3. Tool list and schemas.
+4. Stable system prompt prefix.
+5. Provider headers and beta flags that affect request shape.
+6. Reasoning or thinking mode if it changes request formatting.
+
+Cache-break detection should compare current and prior observations:
+
+1. Compute digests for stable system prompt, tool schemas, cache config, provider options, and message prefix.
+2. Store the prior observation per session.
+3. Compare current cache read tokens to prior cache read tokens.
+4. If cache read drops by more than 5% and more than 1,000 tokens, flag a possible break.
+5. If prompt digests changed, classify it as client-side prompt mutation.
+6. If digests did not change but TTL elapsed, classify it as likely TTL expiry.
+7. If neither changed nor elapsed, classify it as provider routing or eviction.
+
+Recommended Lite defaults:
+
+| Setting | Default |
+| --- | --- |
+| Cache enabled | Yes when provider supports it |
+| Retention | Short |
+| Long retention | Off unless explicitly configured |
+| Cache key | Stable session ID |
+| Explicit Gemini context cache | Off |
+| Unknown proxy cache fields | Off |
+| Stable prompt digest logging | On |
+| Tool schema digest logging | On |
+| Cache usage normalization | On |
+| Cache break detection | On after initial provider integration |
+
+### Prompt Caching Tests
+
+| Test | Purpose |
+| --- | --- |
+| Stable prompt digest | Same stable inputs produce same digest |
+| Dynamic suffix excluded | Date/cwd changes do not alter stable prefix digest |
+| Tool schema ordering | Tool order is deterministic regardless of registration order |
+| JSON key ordering | Schema serialization is stable |
+| Anthropic marker placement | Cache marker lands on stable prefix or configured trailing block |
+| OpenAI cache key | Stable session ID maps to `prompt_cache_key` |
+| Unknown proxy | Unsupported cache fields are not sent |
+| Usage normalization | Provider-specific fields map to common usage buckets |
+| Cache break detection | Digest change classifies client-side cache break |
+| TTL break classification | Same digest after TTL classifies likely expiration |
+
+The recommendation is to build cache-friendly requests and provider adapters, not a local prompt cache.
+
+## Telemetry And LLM Tracing
+
+Telemetry should be part of the harness from the beginning because agent failures are hard to diagnose from final text alone. The most useful telemetry captures the causal tree: user request, prompt assembly, model calls, streamed output, tool calls, policy decisions, cache behavior, context compaction, retries, and final result.
+
+### OpenTelemetry And Langfuse
+
+Langfuse can receive OpenTelemetry traces through its OTLP HTTP endpoint:
+
+```text
+https://cloud.langfuse.com/api/public/otel
+```
+
+For signal-specific exporters, the trace endpoint is:
+
+```text
+https://cloud.langfuse.com/api/public/otel/v1/traces
+```
+
+Langfuse supports OTLP over HTTP using JSON or protobuf. It does not currently support OTLP gRPC ingestion on that endpoint.
+
+Authentication uses Basic Auth with the Langfuse public and secret keys:
+
+```text
+OTEL_EXPORTER_OTLP_ENDPOINT=https://cloud.langfuse.com/api/public/otel
+OTEL_EXPORTER_OTLP_HEADERS=Authorization=Basic <base64(pk-lf-...:sk-lf-...)>,x-langfuse-ingestion-version=4
+```
+
+For Go, the practical path is direct OpenTelemetry instrumentation using `go.opentelemetry.io/otel` and the OTLP HTTP exporter. Do not make Langfuse a hard dependency of the core harness. Emit standard OpenTelemetry spans and let users route OTLP to Langfuse, Honeycomb, Tempo, Grafana, Datadog, or a collector.
+
+### OpenTelemetry GenAI Semantics
+
+OpenTelemetry GenAI semantic conventions are still in development, but they are already useful. Use them where stable enough, and isolate them in one telemetry adapter so attribute names can evolve.
+
+Important span attributes:
+
+| Attribute | Purpose |
+| --- | --- |
+| `gen_ai.operation.name` | Operation type, such as `chat`, `execute_tool`, `invoke_agent`, `retrieval` |
+| `gen_ai.provider.name` | Provider, such as `openai`, `anthropic`, `aws.bedrock`, `gcp.vertex_ai` |
+| `gen_ai.conversation.id` | Session or conversation ID |
+| `gen_ai.request.model` | Requested model |
+| `gen_ai.response.model` | Actual response model |
+| `gen_ai.request.temperature` | Request temperature |
+| `gen_ai.request.max_tokens` | Output token limit |
+| `gen_ai.response.finish_reasons` | Stop reasons |
+| `gen_ai.usage.input_tokens` | Total input tokens, including cached tokens |
+| `gen_ai.usage.output_tokens` | Output tokens |
+| `gen_ai.usage.cache_read.input_tokens` | Provider cache read tokens |
+| `gen_ai.usage.cache_creation.input_tokens` | Provider cache write tokens |
+| `error.type` | Low-cardinality error classification |
+
+Content attributes are opt-in because they may contain secrets or PII:
+
+| Attribute | Risk |
+| --- | --- |
+| `gen_ai.input.messages` | Full prompt and tool results can contain user data and secrets |
+| `gen_ai.output.messages` | Model output can contain sensitive data |
+| `gen_ai.system_instructions` | System prompt can expose proprietary policy and instructions |
+| `gen_ai.tool.definitions` | Tool schemas can be large and reveal internal capabilities |
+
+Recommended metrics:
+
+| Metric | Purpose |
+| --- | --- |
+| `gen_ai.client.operation.duration` | Model or tool operation duration |
+| `gen_ai.client.token.usage` | Token usage histogram with `gen_ai.token.type=input|output` |
+
+Additional useful harness metrics:
+
+| Metric | Purpose |
+| --- | --- |
+| `safeagent.run.duration` | End-to-end run latency |
+| `safeagent.loop.steps` | Loop step count |
+| `safeagent.tool.duration` | Tool latency |
+| `safeagent.tool.errors` | Tool failure count by tool and error class |
+| `safeagent.policy.denials` | Policy denial count |
+| `safeagent.cache.hit_tokens` | Cache read tokens |
+| `safeagent.cache.write_tokens` | Cache write tokens |
+| `safeagent.context.tokens` | Estimated context size at request time |
+
+### Langfuse Mapping
+
+Langfuse maps OpenTelemetry spans into its trace and observation model. It supports standard `gen_ai.*` attributes and a `langfuse.*` namespace for precise mapping.
+
+Trace-level attributes:
+
+| Langfuse Attribute | Purpose |
+| --- | --- |
+| `langfuse.trace.name` | Human-readable trace name |
+| `langfuse.user.id` or `user.id` | User identifier |
+| `langfuse.session.id` or `session.id` | Session identifier |
+| `langfuse.trace.tags` | Tags |
+| `langfuse.trace.metadata.*` | Filterable trace metadata |
+| `langfuse.version` | Application or prompt version |
+| `langfuse.release` | Release identifier |
+
+Observation-level attributes:
+
+| Langfuse Attribute | Purpose |
+| --- | --- |
+| `langfuse.observation.type` | `span`, `generation`, or `event` |
+| `langfuse.observation.model.name` | Model name for a generation |
+| `langfuse.observation.model.parameters` | JSON model parameters |
+| `langfuse.observation.usage_details` | JSON token usage |
+| `langfuse.observation.cost_details` | JSON cost details |
+| `langfuse.observation.input` | JSON input, if content capture is enabled |
+| `langfuse.observation.output` | JSON output, if content capture is enabled |
+| `langfuse.observation.prompt.name` | Langfuse prompt name, if using prompt management |
+| `langfuse.observation.prompt.version` | Langfuse prompt version |
+
+Langfuse recommends propagating trace-level attributes to every span for reliable filtering and aggregation. OpenTelemetry baggage can do this, but baggage crosses service boundaries. Do not put secrets, API keys, raw prompts, or personal data in baggage.
+
+### Recommended Trace Shape
+
+For `safeagent.Lite`, use this hierarchy:
+
+```text
+safeagent.run
+  safeagent.prompt.assemble
+  safeagent.context.estimate
+  gen_ai.chat <model>
+    safeagent.stream.collect
+  safeagent.tool.execute <tool_name>
+    safeagent.policy.authorize
+    safeagent.tool.read_file | safeagent.tool.grep | safeagent.tool.apply_patch
+  gen_ai.chat <model>
+  safeagent.result.finalize
+```
+
+Root span attributes:
+
+| Attribute | Example |
+| --- | --- |
+| `langfuse.trace.name` | `safeagent.lite.run` |
+| `langfuse.session.id` | Session ID |
+| `langfuse.user.id` | User ID if available |
+| `langfuse.trace.tags` | `safeagent,lite,no-bash` |
+| `safeagent.run.id` | Run ID |
+| `safeagent.workspace.id` | Stable workspace hash, not raw path by default |
+| `safeagent.loop.max_steps` | Max step budget |
+| `safeagent.tools.enabled` | Tool names, bounded |
+
+Model span attributes:
+
+| Attribute | Example |
+| --- | --- |
+| `gen_ai.operation.name` | `chat` |
+| `gen_ai.provider.name` | `anthropic` |
+| `gen_ai.request.model` | `claude-sonnet-4-5` |
+| `gen_ai.conversation.id` | Session ID |
+| `gen_ai.request.max_tokens` | Output token limit |
+| `gen_ai.usage.input_tokens` | Total input tokens |
+| `gen_ai.usage.output_tokens` | Output tokens |
+| `gen_ai.usage.cache_read.input_tokens` | Cache read tokens |
+| `gen_ai.usage.cache_creation.input_tokens` | Cache write tokens |
+| `safeagent.prompt.system_sha256` | Stable prompt digest |
+| `safeagent.tools.schema_sha256` | Tool schema digest |
+| `safeagent.cache.retention` | `short` or `long` |
+
+Tool span attributes:
+
+| Attribute | Example |
+| --- | --- |
+| `gen_ai.operation.name` | `execute_tool` |
+| `tool.name` | `read_file` |
+| `safeagent.tool.call_id` | Provider tool call ID |
+| `safeagent.tool.read_only` | `true` |
+| `safeagent.policy.decision` | `allow`, `deny`, `ask` |
+| `safeagent.tool.input_bytes` | Bounded input size |
+| `safeagent.tool.output_bytes` | Bounded output size |
+| `safeagent.tool.output_truncated` | `true` or `false` |
+| `error.type` | Low-cardinality error class |
+
+### Privacy And Security
+
+Telemetry can easily become a data leak. The default should be safe.
+
+Rules:
+
+1. Telemetry should be opt-in for external export.
+2. Raw prompts, model outputs, tool arguments, and tool results should be redacted by default.
+3. Add a separate explicit setting for content capture.
+4. Even when content capture is enabled, truncate content and redact secrets.
+5. Use hashes for prompt/tool schema identity by default.
+6. Do not put raw paths in high-cardinality metric attributes; use hashes or record raw paths only in opt-in trace events.
+7. Do not put secrets or user prompt content in OpenTelemetry baggage.
+8. Bound attribute sizes because OTLP backends often reject or truncate large attributes.
+9. Prefer low-cardinality attributes for metrics.
+10. Keep full replay transcripts in the local session store, not in telemetry, unless the user explicitly enables remote content capture.
+
+### Submodule Telemetry Lessons
+
+| Repo | Telemetry Pattern |
+| --- | --- |
+| `claude-code` | Mature OTel setup with env-configured exporters, console/OTLP support, interaction/LLM/tool/hook spans, redaction by default, hash dedupe for large content, AsyncLocalStorage context, orphan span cleanup, Perfetto local traces |
+| `opencode` | Uses Effect tracing and Vercel AI SDK `experimental_telemetry`, injects `session.id`, wraps HTTP handlers with route spans |
+| `zeroclaw` | Observer abstraction supports `noop`, `log`, `verbose`, Prometheus, and OTLP; creates spans and metrics but should move toward GenAI semantic attributes |
+| `openclaw` | Strong local trajectory tracing and diagnostic trace context; useful for replay and debugging even when remote telemetry is disabled |
+| `pi-mono` | Minimal install telemetry and provider attribution; not a deep LLM tracing reference |
+| `hermes-agent` | Tool traces and plugin hooks exist; Langfuse appears as plugin metadata in tests, but no first-class OTel harness was found |
+
+### Lite Telemetry Design
+
+Keep observability provider-neutral in the core package.
+
+```go
+type Observer interface {
+    StartRun(ctx context.Context, attrs RunAttrs) (context.Context, SpanEnd)
+    StartModelCall(ctx context.Context, attrs ModelCallAttrs) (context.Context, SpanEnd)
+    StartToolCall(ctx context.Context, attrs ToolCallAttrs) (context.Context, SpanEnd)
+    RecordEvent(ctx context.Context, name string, attrs map[string]any)
+    RecordMetric(ctx context.Context, name string, value float64, attrs map[string]any)
+}
+
+type SpanEnd func(err error, attrs map[string]any)
+```
+
+Provide implementations:
+
+| Observer | Purpose |
+| --- | --- |
+| `NoopObserver` | Default safe fallback |
+| `LogObserver` | Local debugging without remote export |
+| `OTelObserver` | Production tracing and metrics through OpenTelemetry |
+
+For Go, use OpenTelemetry directly:
+
+```go
+import (
+    "go.opentelemetry.io/otel"
+    "go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
+    "go.opentelemetry.io/otel/sdk/resource"
+    sdktrace "go.opentelemetry.io/otel/sdk/trace"
+)
+```
+
+Langfuse integration should be configuration, not a compile-time dependency:
+
+```text
+SAFEAGENT_OTEL_EXPORTER=otlp
+OTEL_EXPORTER_OTLP_ENDPOINT=https://cloud.langfuse.com/api/public/otel
+OTEL_EXPORTER_OTLP_HEADERS=Authorization=Basic <base64>,x-langfuse-ingestion-version=4
+```
+
+Recommended Lite defaults:
+
+| Setting | Default |
+| --- | --- |
+| Remote telemetry | Off |
+| Local trace log | Optional |
+| Raw prompt capture | Off |
+| Raw output capture | Off |
+| Tool argument capture | Redacted or hashed |
+| Tool result capture | Redacted, truncated, off for remote by default |
+| Token/cost metrics | On when provider reports usage |
+| Cache diagnostics | On |
+| Prompt/tool digests | On |
+| User/session IDs | Session ID on; user ID only if provided by host |
+
+Telemetry tests:
+
+| Test | Purpose |
+| --- | --- |
+| Noop observer | Harness runs without telemetry configured |
+| Span hierarchy | Run contains model and tool child spans |
+| Error status | Provider and tool errors mark spans failed with `error.type` |
+| Redaction default | Raw prompt and tool result are not exported by default |
+| Content opt-in | Raw content is exported only when explicitly enabled |
+| Attribute bounds | Large content is truncated or hashed |
+| Cache usage attrs | Cache read/write tokens appear on model spans |
+| Langfuse attrs | Session/user/tags use `langfuse.*` or standard equivalents |
+| Baggage safety | No prompt, secret, or tool output enters baggage |
 
 ## Context Management
 
@@ -627,6 +1327,107 @@ Recommended implementation order:
 11. Add context size estimation and hard output limits.
 12. Add audit logging and redaction.
 13. Add compaction only after the base loop is stable.
+
+## Evals
+
+Agent evals should test harness invariants before model quality. The first eval suite should prove that the loop, provider adapter, tool execution, policy gates, context limits, and replay format behave deterministically with fake providers.
+
+Repository patterns:
+
+| Repo | Eval Pattern | Useful Files |
+| --- | --- | --- |
+| `openclaw` | Human-readable QA scenario packs in markdown with YAML fences; flow runner supports calls, variables, assertions, conditionals, loops, and recovery scenarios | `qa/scenarios/index.md`, `extensions/qa-lab/src/scenario-catalog.ts`, `extensions/qa-lab/src/scenario-flow-runner.ts`, `extensions/qa-lab/src/scenario.ts` |
+| `claude-code` | VCR records and replays live provider calls, including streaming output and token counts, with normalized fixture hashes and CI replay behavior | `services/vcr.ts`, `services/api/claude.ts` |
+| `pi-mono` | Coding-agent harness registers a faux provider, in-memory settings, temporary sessions, event capture, and deterministic scripted responses | `packages/coding-agent/test/suite/harness.ts`, `packages/ai/src/providers/faux.ts`, `packages/agent/test/agent-loop.test.ts` |
+| `hermes-agent` | Benchmark environments wrap agent loops in isolated task environments, verifier scripts, deterministic seeds, and aggregate scoring | `environments/hermes_base_env.py`, `environments/agent_loop.py`, `environments/benchmarks/terminalbench_2/terminalbench2_env.py`, `environments/benchmarks/yc_bench/yc_bench_env.py` |
+| `zeroclaw` | Trace replay fixtures define provider turns and declarative expectations; mock providers record requests and fail when traces are exhausted | `tests/support/mock_provider.rs`, `tests/support/trace.rs`, `tests/support/assertions.rs`, `tests/support/mock_tools.rs`, `tests/fixtures/traces/*.json` |
+| `opencode` | In-process fake OpenAI-compatible HTTP/SSE server exercises real serialization and stream parsing; fake provider layers support faster unit tests | `packages/opencode/test/lib/llm-server.ts`, `packages/opencode/test/fake/provider.ts`, `packages/opencode/test/fixture/fixture.ts` |
+
+Recommended Lite eval architecture:
+
+| Component | Purpose |
+| --- | --- |
+| `ScriptedProvider` | FIFO provider responses for fast unit tests; records requests; fails on response exhaustion |
+| `TraceReplayProvider` | Loads JSON traces and returns scripted text, tool calls, errors, and usage |
+| `FakeLLMServer` | Local OpenAI-compatible HTTP/SSE server for provider adapter integration tests |
+| `EvalRunner` | Creates temp workspace, in-memory session store, tool registry, policy, observer, and event capture |
+| `ScenarioCatalog` | Markdown or JSON scenario pack for human-readable behavior specs |
+| `VCRProvider` | Optional wrapper for live-provider recording and replay, disabled by default in CI unless fixtures exist |
+| `Expect` | Declarative assertions over final text, tool calls, tool errors, file changes, policy decisions, and telemetry |
+
+Minimal trace fixture shape:
+
+```json
+{
+  "name": "single-tool-read",
+  "turns": [
+    {
+      "user": "Read README.md and summarize it.",
+      "steps": [
+        {
+          "assistant": {
+            "tool_calls": [
+              { "id": "call_1", "name": "read_file", "arguments": { "path": "README.md" } }
+            ]
+          }
+        },
+        {
+          "assistant": { "text": "README.md describes ..." }
+        }
+      ]
+    }
+  ],
+  "expects": {
+    "tools_used": ["read_file"],
+    "tools_not_used": ["apply_patch"],
+    "response_contains": ["README"],
+    "max_tool_calls": 1
+  }
+}
+```
+
+Core assertion types:
+
+| Assertion | Checks |
+| --- | --- |
+| `response_contains` / `response_not_contains` | Final answer content |
+| `response_matches` | Final answer regex |
+| `tools_used` / `tools_not_used` | Tool selection |
+| `tool_call_count` / `max_tool_calls` | Loop/tool budget |
+| `tool_args_match` | Exact or partial argument shape |
+| `all_tool_calls_have_results` | Provider tool-call pairing invariant |
+| `policy_denied` | Safety gate triggered for forbidden action |
+| `file_equals` / `file_contains` | Workspace mutation result |
+| `no_external_path_access` | Workspace boundary enforcement |
+| `telemetry_has_span` | Trace shape and key attributes |
+| `prompt_digest_stable` | Prompt/cache stability |
+
+Eval levels:
+
+| Level | Runs In CI | Provider | Purpose |
+| --- | --- | --- | --- |
+| Unit | Yes | Scripted provider | Loop invariants, tool-result pairing, policy errors, cancellation |
+| Trace replay | Yes | Trace replay provider | Regressions across known agent transcripts |
+| Fake HTTP/SSE | Yes | Local fake server | Provider adapter serialization and streaming |
+| Scenario pack | Yes for deterministic scenarios | Scripted provider or fake server | Higher-level workflows and safety cases |
+| VCR replay | Optional | Recorded live calls | Provider compatibility without paid calls |
+| Live model eval | Manual or nightly | Real provider | Model quality, prompt changes, tool-choice behavior |
+| Sandbox benchmark | Manual or nightly | Real or scripted provider | End-to-end tasks with isolated verifiers |
+
+Safety evals should be mandatory before mutation tools ship:
+
+1. Path traversal with `../` is denied.
+2. Symlink escape is denied.
+3. Absolute path outside workspace is denied.
+4. `.env`, private keys, and credential files are denied or require approval.
+5. Writes under `.git` are denied.
+6. Patch attempts that do not match file context fail safely.
+7. Unknown tools return structured tool errors.
+8. Invalid JSON arguments return structured tool errors.
+9. Tool output is truncated and marked as truncated.
+10. Redaction removes common secret patterns from logs and telemetry.
+
+Avoid arbitrary code evaluation in eval files. OpenClaw's QA flow is flexible, but Lite should start with a small declarative assertion DSL so evals are safe to run on untrusted scenario packs.
 
 ## Test Plan
 
