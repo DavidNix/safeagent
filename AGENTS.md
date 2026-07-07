@@ -7,11 +7,11 @@ SafeAgent is a monorepo with language-specific workspaces. Go code lives in `go/
 ## Quick Start
 
 ```bash
-make vet          # Run all static checks
-make test         # Run all tests
+make vet          # Run all static checks (delegates to each workspace)
+make test         # Run all tests (delegates to each workspace)
 ```
 
-Each language sufolder has their own Makefile.
+Each language subfolder has its own Makefile with workspace-specific targets; see `go/AGENTS.md`.
 
 ## Hard Constraints
 
@@ -21,4 +21,4 @@ Each language sufolder has their own Makefile.
 
 ## Structure
 
-- `go/` - Go module rooted at `github.com/DavidNix/safeagent`.
+- `go/` - Go module rooted at `github.com/DavidNix/safeagent`. See `go/AGENTS.md`.
