@@ -13,7 +13,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestCBClient_ChatCompletionsNew(t *testing.T) {
+func TestCompletionClient_New(t *testing.T) {
 	t.Parallel()
 
 	t.Run("happy path uses VLLM config and mirrors OpenAI call shape", func(t *testing.T) {
@@ -22,7 +22,7 @@ func TestCBClient_ChatCompletionsNew(t *testing.T) {
 		t.Cleanup(server.Close)
 
 		budget := 0
-		cb := NewClient(Options{
+		client, err := NewCompletionClient(Options{
 			Primary: VLLMConfig{
 				APIKey:               "local-key",
 				ChatBaseURL:          server.URL,
@@ -35,8 +35,9 @@ func TestCBClient_ChatCompletionsNew(t *testing.T) {
 			},
 			HTTPClient: headerHTTPClient("X-Custom-HTTP-Client", "used"),
 		})
+		require.NoError(t, err)
 
-		completion, err := cb.Chat.Completions.New(t.Context(), openai.ChatCompletionNewParams{
+		completion, err := client.New(t.Context(), openai.ChatCompletionNewParams{
 			Model: "caller-model",
 			Messages: []openai.ChatCompletionMessageParamUnion{
 				openai.UserMessage("hello"),
@@ -71,7 +72,7 @@ func TestCBClient_ChatCompletionsNew(t *testing.T) {
 		t.Cleanup(fallbackServer.Close)
 
 		budget := 128
-		cb := NewClient(Options{
+		client, err := NewCompletionClient(Options{
 			Primary: VLLMConfig{
 				ChatBaseURL:          primaryServer.URL,
 				EmbeddingsBaseURL:    primaryServer.URL,
@@ -91,8 +92,9 @@ func TestCBClient_ChatCompletionsNew(t *testing.T) {
 				QueryParams:              map[string]string{"route": "openrouter"},
 			}},
 		})
+		require.NoError(t, err)
 
-		completion, err := cb.Chat.Completions.New(t.Context(), openai.ChatCompletionNewParams{
+		completion, err := client.New(t.Context(), openai.ChatCompletionNewParams{
 			Model: "caller-model",
 			Messages: []openai.ChatCompletionMessageParamUnion{
 				openai.UserMessage("hello"),
@@ -124,7 +126,7 @@ func TestCBClient_ChatCompletionsNew(t *testing.T) {
 		fallbackServer := chatCompletionServer(t, http.StatusOK, `{"fallback":true}`, nil, &fallbackHits)
 		t.Cleanup(fallbackServer.Close)
 
-		cb := NewClient(Options{
+		client, err := NewCompletionClient(Options{
 			Primary: VLLMConfig{
 				ChatBaseURL:       primaryServer.URL,
 				EmbeddingsBaseURL: primaryServer.URL,
@@ -138,8 +140,9 @@ func TestCBClient_ChatCompletionsNew(t *testing.T) {
 				EmbeddingModel: "openrouter-embedding",
 			}},
 		})
+		require.NoError(t, err)
 
-		_, err := cb.Chat.Completions.New(t.Context(), openai.ChatCompletionNewParams{
+		_, err = client.New(t.Context(), openai.ChatCompletionNewParams{
 			Model: "caller-model",
 			Messages: []openai.ChatCompletionMessageParamUnion{
 				openai.UserMessage("hello"),
@@ -167,7 +170,7 @@ func TestCBClient_ChatCompletionsNew(t *testing.T) {
 		fallbackServer := chatCompletionServer(t, http.StatusOK, `{"fallback":true}`, nil, nil)
 		t.Cleanup(fallbackServer.Close)
 
-		cb := NewClient(Options{
+		client, err := NewCompletionClient(Options{
 			Primary: VLLMConfig{
 				ChatBaseURL:       primaryServer.URL,
 				EmbeddingsBaseURL: primaryServer.URL,
@@ -188,9 +191,10 @@ func TestCBClient_ChatCompletionsNew(t *testing.T) {
 				Now:                      clock.Now,
 			},
 		})
+		require.NoError(t, err)
 
 		for range 2 {
-			_, err := cb.Chat.Completions.New(t.Context(), openai.ChatCompletionNewParams{
+			_, err = client.New(t.Context(), openai.ChatCompletionNewParams{
 				Model: "caller-model",
 				Messages: []openai.ChatCompletionMessageParamUnion{
 					openai.UserMessage("hello"),
@@ -200,7 +204,7 @@ func TestCBClient_ChatCompletionsNew(t *testing.T) {
 		}
 
 		primaryBefore := primaryHits.Load()
-		_, err := cb.Chat.Completions.New(t.Context(), openai.ChatCompletionNewParams{
+		_, err = client.New(t.Context(), openai.ChatCompletionNewParams{
 			Model: "caller-model",
 			Messages: []openai.ChatCompletionMessageParamUnion{
 				openai.UserMessage("hello"),
@@ -211,7 +215,7 @@ func TestCBClient_ChatCompletionsNew(t *testing.T) {
 
 		primaryHealthy.Store(true)
 		clock.Advance(time.Minute)
-		_, err = cb.Chat.Completions.New(t.Context(), openai.ChatCompletionNewParams{
+		_, err = client.New(t.Context(), openai.ChatCompletionNewParams{
 			Model: "caller-model",
 			Messages: []openai.ChatCompletionMessageParamUnion{
 				openai.UserMessage("hello"),
@@ -220,7 +224,7 @@ func TestCBClient_ChatCompletionsNew(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, primaryBefore+1, primaryHits.Load())
 
-		_, err = cb.Chat.Completions.New(t.Context(), openai.ChatCompletionNewParams{
+		_, err = client.New(t.Context(), openai.ChatCompletionNewParams{
 			Model: "caller-model",
 			Messages: []openai.ChatCompletionMessageParamUnion{
 				openai.UserMessage("hello"),
@@ -239,7 +243,7 @@ func TestCBClient_ChatCompletionsNew(t *testing.T) {
 		fallbackServer := chatCompletionServer(t, http.StatusOK, `{"fallback":true}`, nil, nil)
 		t.Cleanup(fallbackServer.Close)
 
-		cb := NewClient(Options{
+		client, err := NewCompletionClient(Options{
 			Primary: VLLMConfig{
 				ChatBaseURL:       primaryServer.URL,
 				EmbeddingsBaseURL: primaryServer.URL,
@@ -259,8 +263,9 @@ func TestCBClient_ChatCompletionsNew(t *testing.T) {
 				Now:                      clock.Now,
 			},
 		})
+		require.NoError(t, err)
 
-		_, err := cb.Chat.Completions.New(t.Context(), openai.ChatCompletionNewParams{
+		_, err = client.New(t.Context(), openai.ChatCompletionNewParams{
 			Model: "caller-model",
 			Messages: []openai.ChatCompletionMessageParamUnion{
 				openai.UserMessage("hello"),
@@ -270,7 +275,7 @@ func TestCBClient_ChatCompletionsNew(t *testing.T) {
 		primaryBeforeProbe := primaryHits.Load()
 
 		clock.Advance(time.Minute)
-		_, err = cb.Chat.Completions.New(t.Context(), openai.ChatCompletionNewParams{
+		_, err = client.New(t.Context(), openai.ChatCompletionNewParams{
 			Model: "caller-model",
 			Messages: []openai.ChatCompletionMessageParamUnion{
 				openai.UserMessage("hello"),
@@ -280,7 +285,7 @@ func TestCBClient_ChatCompletionsNew(t *testing.T) {
 		require.Equal(t, primaryBeforeProbe+1, primaryHits.Load())
 
 		primaryAfterProbe := primaryHits.Load()
-		_, err = cb.Chat.Completions.New(t.Context(), openai.ChatCompletionNewParams{
+		_, err = client.New(t.Context(), openai.ChatCompletionNewParams{
 			Model: "caller-model",
 			Messages: []openai.ChatCompletionMessageParamUnion{
 				openai.UserMessage("hello"),
@@ -308,7 +313,7 @@ func TestCBClient_ChatCompletionsNew(t *testing.T) {
 		fallbackServer := chatCompletionServer(t, http.StatusOK, `{"fallback":true}`, nil, nil)
 		t.Cleanup(fallbackServer.Close)
 
-		cb := NewClient(Options{
+		client, err := NewCompletionClient(Options{
 			Primary: VLLMConfig{
 				ChatBaseURL:       primaryServer.URL,
 				EmbeddingsBaseURL: primaryServer.URL,
@@ -329,8 +334,9 @@ func TestCBClient_ChatCompletionsNew(t *testing.T) {
 				Now:                      clock.Now,
 			},
 		})
+		require.NoError(t, err)
 
-		_, err := cb.Chat.Completions.New(t.Context(), openai.ChatCompletionNewParams{
+		_, err = client.New(t.Context(), openai.ChatCompletionNewParams{
 			Model: "caller-model",
 			Messages: []openai.ChatCompletionMessageParamUnion{
 				openai.UserMessage("hello"),
@@ -341,7 +347,7 @@ func TestCBClient_ChatCompletionsNew(t *testing.T) {
 		primaryHealthy.Store(true)
 		clock.Advance(time.Minute)
 		primaryBeforeProbe := primaryHits.Load()
-		_, err = cb.Chat.Completions.New(t.Context(), openai.ChatCompletionNewParams{
+		_, err = client.New(t.Context(), openai.ChatCompletionNewParams{
 			Model: "caller-model",
 			Messages: []openai.ChatCompletionMessageParamUnion{
 				openai.UserMessage("hello"),
@@ -351,7 +357,7 @@ func TestCBClient_ChatCompletionsNew(t *testing.T) {
 		require.Equal(t, primaryBeforeProbe+1, primaryHits.Load())
 
 		primaryAfterFirstProbe := primaryHits.Load()
-		_, err = cb.Chat.Completions.New(t.Context(), openai.ChatCompletionNewParams{
+		_, err = client.New(t.Context(), openai.ChatCompletionNewParams{
 			Model: "caller-model",
 			Messages: []openai.ChatCompletionMessageParamUnion{
 				openai.UserMessage("hello"),
@@ -361,7 +367,7 @@ func TestCBClient_ChatCompletionsNew(t *testing.T) {
 		require.Equal(t, primaryAfterFirstProbe, primaryHits.Load())
 
 		clock.Advance(10 * time.Second)
-		_, err = cb.Chat.Completions.New(t.Context(), openai.ChatCompletionNewParams{
+		_, err = client.New(t.Context(), openai.ChatCompletionNewParams{
 			Model: "caller-model",
 			Messages: []openai.ChatCompletionMessageParamUnion{
 				openai.UserMessage("hello"),
@@ -370,7 +376,7 @@ func TestCBClient_ChatCompletionsNew(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, primaryAfterFirstProbe+1, primaryHits.Load())
 
-		_, err = cb.Chat.Completions.New(t.Context(), openai.ChatCompletionNewParams{
+		_, err = client.New(t.Context(), openai.ChatCompletionNewParams{
 			Model: "caller-model",
 			Messages: []openai.ChatCompletionMessageParamUnion{
 				openai.UserMessage("hello"),
@@ -381,7 +387,7 @@ func TestCBClient_ChatCompletionsNew(t *testing.T) {
 	})
 }
 
-func TestCBClient_EmbeddingsNew(t *testing.T) {
+func TestEmbeddingClient_New(t *testing.T) {
 	t.Parallel()
 
 	t.Run("happy path uses embedding model and mirrors OpenAI call shape", func(t *testing.T) {
@@ -389,7 +395,7 @@ func TestCBClient_EmbeddingsNew(t *testing.T) {
 		server := embeddingServer(t, http.StatusOK, request, nil)
 		t.Cleanup(server.Close)
 
-		cb := NewClient(Options{
+		client, err := NewEmbeddingClient(Options{
 			Primary: VLLMConfig{
 				APIKey:            "local-key",
 				ChatBaseURL:       server.URL,
@@ -400,8 +406,9 @@ func TestCBClient_EmbeddingsNew(t *testing.T) {
 				QueryParams:       map[string]string{"backend": "vllm"},
 			},
 		})
+		require.NoError(t, err)
 
-		response, err := cb.Embeddings.New(t.Context(), openai.EmbeddingNewParams{
+		response, err := client.New(t.Context(), openai.EmbeddingNewParams{
 			Model: "caller-model",
 			Input: openai.EmbeddingNewParamsInputUnion{
 				OfString: openai.String("hello"),
@@ -424,7 +431,7 @@ func TestCBClient_EmbeddingsNew(t *testing.T) {
 		fallbackServer := embeddingServer(t, http.StatusOK, fallbackRequest, nil)
 		t.Cleanup(fallbackServer.Close)
 
-		cb := NewClient(Options{
+		client, err := NewEmbeddingClient(Options{
 			Primary: VLLMConfig{
 				ChatBaseURL:       primaryServer.URL,
 				EmbeddingsBaseURL: primaryServer.URL,
@@ -438,8 +445,9 @@ func TestCBClient_EmbeddingsNew(t *testing.T) {
 				EmbeddingModel: "openrouter-embedding",
 			}},
 		})
+		require.NoError(t, err)
 
-		response, err := cb.Embeddings.New(t.Context(), openai.EmbeddingNewParams{
+		response, err := client.New(t.Context(), openai.EmbeddingNewParams{
 			Model: "caller-model",
 			Input: openai.EmbeddingNewParamsInputUnion{
 				OfString: openai.String("hello"),

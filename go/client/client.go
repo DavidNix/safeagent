@@ -82,80 +82,85 @@ type Options struct {
 	HTTPClient *http.Client
 }
 
-// CBClient mirrors the OpenAI client service shape with circuit-breaker routing.
-type CBClient struct {
-	Chat       ChatService
-	Embeddings EmbeddingService
-
-	primary   providerRuntime
-	fallbacks []providerRuntime
+// CompletionClient creates chat completions through a circuit-breaker provider chain.
+type CompletionClient struct {
+	primary   completionProvider
+	fallbacks []completionProvider
 	breaker   *circuitBreaker
-	initErr   error
 }
 
-// ChatService mirrors openai.Client.Chat.
-type ChatService struct {
-	Completions ChatCompletionService
+// EmbeddingClient creates embeddings through a circuit-breaker provider chain.
+type EmbeddingClient struct {
+	primary   embeddingProvider
+	fallbacks []embeddingProvider
+	breaker   *circuitBreaker
 }
 
-// ChatCompletionService mirrors openai.Client.Chat.Completions.
-type ChatCompletionService struct {
-	client *CBClient
-}
-
-// EmbeddingService mirrors openai.Client.Embeddings.
-type EmbeddingService struct {
-	client *CBClient
-}
-
-func NewClient(opts Options) *CBClient {
+func NewCompletionClient(opts Options) (*CompletionClient, error) {
 	httpClient := httpClientOrDefault(opts.HTTPClient)
-	primary, err := compileProvider(opts.Primary, httpClient)
-	var fallbacks []providerRuntime
-	if err == nil {
-		fallbacks, err = compileFallbacks(opts.Fallbacks, httpClient)
+	primary, err := compileCompletionProvider(opts.Primary, httpClient)
+	if err != nil {
+		return nil, err
+	}
+	fallbacks, err := compileCompletionFallbacks(opts.Fallbacks, httpClient)
+	if err != nil {
+		return nil, err
 	}
 
-	cb := &CBClient{
+	return &CompletionClient{
 		primary:   primary,
 		fallbacks: fallbacks,
 		breaker:   newCircuitBreaker(opts.Breaker, len(fallbacks) > 0),
-		initErr:   err,
-	}
-	cb.Chat = ChatService{Completions: ChatCompletionService{client: cb}}
-	cb.Embeddings = EmbeddingService{client: cb}
-	return cb
+	}, nil
 }
 
-// New creates a chat completion through the configured provider chain.
-func (s ChatCompletionService) New(ctx context.Context, params openai.ChatCompletionNewParams, opts ...option.RequestOption) (*openai.ChatCompletion, error) {
-	if s.client == nil {
-		return nil, errors.New("client not initialized")
+func NewEmbeddingClient(opts Options) (*EmbeddingClient, error) {
+	httpClient := httpClientOrDefault(opts.HTTPClient)
+	primary, err := compileEmbeddingProvider(opts.Primary, httpClient)
+	if err != nil {
+		return nil, err
 	}
-	return s.client.newChatCompletion(ctx, params, opts...)
+	fallbacks, err := compileEmbeddingFallbacks(opts.Fallbacks, httpClient)
+	if err != nil {
+		return nil, err
+	}
+
+	return &EmbeddingClient{
+		primary:   primary,
+		fallbacks: fallbacks,
+		breaker:   newCircuitBreaker(opts.Breaker, len(fallbacks) > 0),
+	}, nil
 }
 
-// New creates embeddings through the configured provider chain.
-func (s EmbeddingService) New(ctx context.Context, params openai.EmbeddingNewParams, opts ...option.RequestOption) (*openai.CreateEmbeddingResponse, error) {
-	if s.client == nil {
-		return nil, errors.New("client not initialized")
-	}
-	return s.client.newEmbedding(ctx, params, opts...)
+type providerSettings struct {
+	name                 string
+	apiKey               string
+	chatBaseURL          string
+	embeddingsBaseURL    string
+	chatModel            string
+	embeddingModel       string
+	requestOptions       []option.RequestOption
+	reasoningTokenBudget *int
 }
 
-type providerRuntime struct {
+type completionProvider struct {
 	name           string
-	chat           openai.Client
-	embeddings     openai.Client
-	chatModel      string
-	embeddingModel string
+	client         openai.Client
+	model          string
 	requestOptions []option.RequestOption
 }
 
-func compileFallbacks(providers []Provider, httpClient *http.Client) ([]providerRuntime, error) {
-	fallbacks := make([]providerRuntime, 0, len(providers))
+type embeddingProvider struct {
+	name           string
+	client         openai.Client
+	model          string
+	requestOptions []option.RequestOption
+}
+
+func compileCompletionFallbacks(providers []Provider, httpClient *http.Client) ([]completionProvider, error) {
+	fallbacks := make([]completionProvider, 0, len(providers))
 	for _, provider := range providers {
-		runtime, err := compileProvider(provider, httpClient)
+		runtime, err := compileCompletionProvider(provider, httpClient)
 		if err != nil {
 			return nil, err
 		}
@@ -164,56 +169,99 @@ func compileFallbacks(providers []Provider, httpClient *http.Client) ([]provider
 	return fallbacks, nil
 }
 
-func compileProvider(provider Provider, httpClient *http.Client) (providerRuntime, error) {
-	switch p := provider.(type) {
-	case VLLMConfig:
-		return compileVLLM(p, httpClient)
-	case *VLLMConfig:
-		if p == nil {
-			return providerRuntime{}, errors.New("nil vllm provider")
+func compileEmbeddingFallbacks(providers []Provider, httpClient *http.Client) ([]embeddingProvider, error) {
+	fallbacks := make([]embeddingProvider, 0, len(providers))
+	for _, provider := range providers {
+		runtime, err := compileEmbeddingProvider(provider, httpClient)
+		if err != nil {
+			return nil, err
 		}
-		return compileVLLM(*p, httpClient)
-	case OpenRouterConfig:
-		return compileOpenRouter(p, httpClient)
-	case *OpenRouterConfig:
-		if p == nil {
-			return providerRuntime{}, errors.New("nil openrouter provider")
-		}
-		return compileOpenRouter(*p, httpClient)
-	default:
-		return providerRuntime{}, errors.New("unsupported provider")
+		fallbacks = append(fallbacks, runtime)
 	}
+	return fallbacks, nil
 }
 
-func compileVLLM(cfg VLLMConfig, httpClient *http.Client) (providerRuntime, error) {
-	if cfg.ChatBaseURL == "" {
-		return providerRuntime{}, errors.New("vllm chat base url is required")
+func compileCompletionProvider(provider Provider, httpClient *http.Client) (completionProvider, error) {
+	settings, err := compileProviderSettings(provider)
+	if err != nil {
+		return completionProvider{}, err
 	}
-	embeddingsBaseURL := cfg.EmbeddingsBaseURL
-	if embeddingsBaseURL == "" {
-		embeddingsBaseURL = cfg.ChatBaseURL
+	if settings.chatBaseURL == "" {
+		return completionProvider{}, fmt.Errorf("%s chat base url is required", settings.name)
 	}
 
-	apiKey := cfg.APIKey
-	if apiKey == "" {
-		apiKey = defaultLocalAPIKey
-	}
-	requestOptions := requestOptionsFromMaps(cfg.Headers, cfg.QueryParams, cfg.ExtraFields)
-	requestOptions = append(requestOptions, reasoningOptions(cfg.ReasoningTokenBudget)...)
-
-	return providerRuntime{
-		name:           "vllm",
-		chat:           newOpenAIClient(apiKey, cfg.ChatBaseURL, httpClient),
-		embeddings:     newOpenAIClient(apiKey, embeddingsBaseURL, httpClient),
-		chatModel:      cfg.ChatModel,
-		embeddingModel: cfg.EmbeddingModel,
+	requestOptions := append([]option.RequestOption{}, settings.requestOptions...)
+	requestOptions = append(requestOptions, reasoningOptions(settings.reasoningTokenBudget)...)
+	return completionProvider{
+		name:           settings.name,
+		client:         newOpenAIClient(settings.apiKey, settings.chatBaseURL, httpClient),
+		model:          settings.chatModel,
 		requestOptions: requestOptions,
 	}, nil
 }
 
-func compileOpenRouter(cfg OpenRouterConfig, httpClient *http.Client) (providerRuntime, error) {
+func compileEmbeddingProvider(provider Provider, httpClient *http.Client) (embeddingProvider, error) {
+	settings, err := compileProviderSettings(provider)
+	if err != nil {
+		return embeddingProvider{}, err
+	}
+	embeddingsBaseURL := settings.embeddingsBaseURL
+	if embeddingsBaseURL == "" {
+		embeddingsBaseURL = settings.chatBaseURL
+	}
+	if embeddingsBaseURL == "" {
+		return embeddingProvider{}, fmt.Errorf("%s embeddings base url is required", settings.name)
+	}
+
+	return embeddingProvider{
+		name:           settings.name,
+		client:         newOpenAIClient(settings.apiKey, embeddingsBaseURL, httpClient),
+		model:          settings.embeddingModel,
+		requestOptions: settings.requestOptions,
+	}, nil
+}
+
+func compileProviderSettings(provider Provider) (providerSettings, error) {
+	switch p := provider.(type) {
+	case VLLMConfig:
+		return compileVLLMSettings(p)
+	case *VLLMConfig:
+		if p == nil {
+			return providerSettings{}, errors.New("nil vllm provider")
+		}
+		return compileVLLMSettings(*p)
+	case OpenRouterConfig:
+		return compileOpenRouterSettings(p)
+	case *OpenRouterConfig:
+		if p == nil {
+			return providerSettings{}, errors.New("nil openrouter provider")
+		}
+		return compileOpenRouterSettings(*p)
+	default:
+		return providerSettings{}, errors.New("unsupported provider")
+	}
+}
+
+func compileVLLMSettings(cfg VLLMConfig) (providerSettings, error) {
+	apiKey := cfg.APIKey
+	if apiKey == "" {
+		apiKey = defaultLocalAPIKey
+	}
+	return providerSettings{
+		name:                 "vllm",
+		apiKey:               apiKey,
+		chatBaseURL:          cfg.ChatBaseURL,
+		embeddingsBaseURL:    cfg.EmbeddingsBaseURL,
+		chatModel:            cfg.ChatModel,
+		embeddingModel:       cfg.EmbeddingModel,
+		requestOptions:       requestOptionsFromMaps(cfg.Headers, cfg.QueryParams, cfg.ExtraFields),
+		reasoningTokenBudget: cfg.ReasoningTokenBudget,
+	}, nil
+}
+
+func compileOpenRouterSettings(cfg OpenRouterConfig) (providerSettings, error) {
 	if cfg.APIKey == "" {
-		return providerRuntime{}, errors.New("openrouter api key is required")
+		return providerSettings{}, errors.New("openrouter api key is required")
 	}
 	baseURL := cfg.BaseURL
 	if baseURL == "" {
@@ -234,15 +282,14 @@ func compileOpenRouter(cfg OpenRouterConfig, httpClient *http.Client) (providerR
 		extraFields["provider.zdr"] = true
 	}
 
-	requestOptions := requestOptionsFromMaps(headers, cfg.QueryParams, extraFields)
-	apiClient := newOpenAIClient(cfg.APIKey, baseURL, httpClient)
-	return providerRuntime{
-		name:           "openrouter",
-		chat:           apiClient,
-		embeddings:     apiClient,
-		chatModel:      cfg.ChatModel,
-		embeddingModel: cfg.EmbeddingModel,
-		requestOptions: requestOptions,
+	return providerSettings{
+		name:              "openrouter",
+		apiKey:            cfg.APIKey,
+		chatBaseURL:       baseURL,
+		embeddingsBaseURL: baseURL,
+		chatModel:         cfg.ChatModel,
+		embeddingModel:    cfg.EmbeddingModel,
+		requestOptions:    requestOptionsFromMaps(headers, cfg.QueryParams, extraFields),
 	}, nil
 }
 
@@ -323,14 +370,11 @@ func newDefaultHTTPClient() *http.Client {
 	}
 }
 
-func (c *CBClient) newChatCompletion(ctx context.Context, params openai.ChatCompletionNewParams, opts ...option.RequestOption) (*openai.ChatCompletion, error) {
-	if c.initErr != nil {
-		return nil, c.initErr
-	}
-
+// New creates a chat completion through the configured provider chain.
+func (c *CompletionClient) New(ctx context.Context, params openai.ChatCompletionNewParams, opts ...option.RequestOption) (*openai.ChatCompletion, error) {
 	decision := c.breaker.decide()
 	if decision.routePrimary {
-		result, err := c.primary.chat.Chat.Completions.New(ctx, chatParamsForProvider(params, c.primary), requestOptions(c.primary, opts)...)
+		result, err := c.primary.client.Chat.Completions.New(ctx, chatParamsForProvider(params, c.primary), requestOptions(c.primary.requestOptions, opts)...)
 		if err != nil {
 			if !isTriggerError(ctx, err) {
 				return nil, err
@@ -350,9 +394,9 @@ func (c *CBClient) newChatCompletion(ctx context.Context, params openai.ChatComp
 	return c.fallbackChat(ctx, params, nil, opts...)
 }
 
-func (c *CBClient) fallbackChat(ctx context.Context, params openai.ChatCompletionNewParams, errs []error, opts ...option.RequestOption) (*openai.ChatCompletion, error) {
+func (c *CompletionClient) fallbackChat(ctx context.Context, params openai.ChatCompletionNewParams, errs []error, opts ...option.RequestOption) (*openai.ChatCompletion, error) {
 	for _, fallback := range c.fallbacks {
-		result, err := fallback.chat.Chat.Completions.New(ctx, chatParamsForProvider(params, fallback), requestOptions(fallback, opts)...)
+		result, err := fallback.client.Chat.Completions.New(ctx, chatParamsForProvider(params, fallback), requestOptions(fallback.requestOptions, opts)...)
 		if err != nil {
 			if !isTriggerError(ctx, err) {
 				return nil, err
@@ -366,14 +410,11 @@ func (c *CBClient) fallbackChat(ctx context.Context, params openai.ChatCompletio
 	return nil, errors.Join(errs...)
 }
 
-func (c *CBClient) newEmbedding(ctx context.Context, params openai.EmbeddingNewParams, opts ...option.RequestOption) (*openai.CreateEmbeddingResponse, error) {
-	if c.initErr != nil {
-		return nil, c.initErr
-	}
-
+// New creates embeddings through the configured provider chain.
+func (c *EmbeddingClient) New(ctx context.Context, params openai.EmbeddingNewParams, opts ...option.RequestOption) (*openai.CreateEmbeddingResponse, error) {
 	decision := c.breaker.decide()
 	if decision.routePrimary {
-		result, err := c.primary.embeddings.Embeddings.New(ctx, embeddingParamsForProvider(params, c.primary), requestOptions(c.primary, opts)...)
+		result, err := c.primary.client.Embeddings.New(ctx, embeddingParamsForProvider(params, c.primary), requestOptions(c.primary.requestOptions, opts)...)
 		if err != nil {
 			if !isTriggerError(ctx, err) {
 				return nil, err
@@ -393,9 +434,9 @@ func (c *CBClient) newEmbedding(ctx context.Context, params openai.EmbeddingNewP
 	return c.fallbackEmbedding(ctx, params, nil, opts...)
 }
 
-func (c *CBClient) fallbackEmbedding(ctx context.Context, params openai.EmbeddingNewParams, errs []error, opts ...option.RequestOption) (*openai.CreateEmbeddingResponse, error) {
+func (c *EmbeddingClient) fallbackEmbedding(ctx context.Context, params openai.EmbeddingNewParams, errs []error, opts ...option.RequestOption) (*openai.CreateEmbeddingResponse, error) {
 	for _, fallback := range c.fallbacks {
-		result, err := fallback.embeddings.Embeddings.New(ctx, embeddingParamsForProvider(params, fallback), requestOptions(fallback, opts)...)
+		result, err := fallback.client.Embeddings.New(ctx, embeddingParamsForProvider(params, fallback), requestOptions(fallback.requestOptions, opts)...)
 		if err != nil {
 			if !isTriggerError(ctx, err) {
 				return nil, err
@@ -409,23 +450,23 @@ func (c *CBClient) fallbackEmbedding(ctx context.Context, params openai.Embeddin
 	return nil, errors.Join(errs...)
 }
 
-func requestOptions(provider providerRuntime, opts []option.RequestOption) []option.RequestOption {
-	requestOptions := make([]option.RequestOption, 0, len(provider.requestOptions)+len(opts))
-	requestOptions = append(requestOptions, provider.requestOptions...)
+func requestOptions(providerOptions []option.RequestOption, opts []option.RequestOption) []option.RequestOption {
+	requestOptions := make([]option.RequestOption, 0, len(providerOptions)+len(opts))
+	requestOptions = append(requestOptions, providerOptions...)
 	requestOptions = append(requestOptions, opts...)
 	return requestOptions
 }
 
-func chatParamsForProvider(params openai.ChatCompletionNewParams, provider providerRuntime) openai.ChatCompletionNewParams {
-	if provider.chatModel != "" {
-		params.Model = provider.chatModel
+func chatParamsForProvider(params openai.ChatCompletionNewParams, provider completionProvider) openai.ChatCompletionNewParams {
+	if provider.model != "" {
+		params.Model = provider.model
 	}
 	return params
 }
 
-func embeddingParamsForProvider(params openai.EmbeddingNewParams, provider providerRuntime) openai.EmbeddingNewParams {
-	if provider.embeddingModel != "" {
-		params.Model = provider.embeddingModel
+func embeddingParamsForProvider(params openai.EmbeddingNewParams, provider embeddingProvider) openai.EmbeddingNewParams {
+	if provider.model != "" {
+		params.Model = provider.model
 	}
 	return params
 }

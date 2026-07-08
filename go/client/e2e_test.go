@@ -8,7 +8,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestCBClient_E2E(t *testing.T) {
+func TestClient_E2E(t *testing.T) {
 	t.Parallel()
 
 	if testing.Short() {
@@ -23,7 +23,7 @@ func TestCBClient_E2E(t *testing.T) {
 			t.Skip("SAFEAGENT_OPENROUTER_API_KEY, SAFEAGENT_OPENROUTER_CHAT_MODEL, and SAFEAGENT_OPENROUTER_EMBEDDING_MODEL must be set")
 		}
 
-		cb := NewClient(Options{
+		completionClient, err := NewCompletionClient(Options{
 			Primary: OpenRouterConfig{
 				APIKey:                   apiKey,
 				ChatModel:                chatModel,
@@ -31,8 +31,18 @@ func TestCBClient_E2E(t *testing.T) {
 				RequireZeroDataRetention: true,
 			},
 		})
+		require.NoError(t, err)
+		embeddingClient, err := NewEmbeddingClient(Options{
+			Primary: OpenRouterConfig{
+				APIKey:                   apiKey,
+				ChatModel:                chatModel,
+				EmbeddingModel:           embeddingModel,
+				RequireZeroDataRetention: true,
+			},
+		})
+		require.NoError(t, err)
 
-		completion, err := cb.Chat.Completions.New(t.Context(), openai.ChatCompletionNewParams{
+		completion, err := completionClient.New(t.Context(), openai.ChatCompletionNewParams{
 			Messages: []openai.ChatCompletionMessageParamUnion{
 				openai.UserMessage("Reply with exactly: safeagent"),
 			},
@@ -40,7 +50,7 @@ func TestCBClient_E2E(t *testing.T) {
 		require.NoError(t, err)
 		require.NotEmpty(t, completion.Choices)
 
-		embeddings, err := cb.Embeddings.New(t.Context(), openai.EmbeddingNewParams{
+		embeddings, err := embeddingClient.New(t.Context(), openai.EmbeddingNewParams{
 			Input: openai.EmbeddingNewParamsInputUnion{OfString: openai.String("safeagent")},
 		})
 		require.NoError(t, err)
@@ -57,7 +67,7 @@ func TestCBClient_E2E(t *testing.T) {
 			t.Skip("SAFEAGENT_VLLM_CHAT_BASE_URL, SAFEAGENT_VLLM_EMBEDDINGS_BASE_URL, SAFEAGENT_VLLM_CHAT_MODEL, and SAFEAGENT_VLLM_EMBEDDING_MODEL must be set")
 		}
 
-		cb := NewClient(Options{
+		completionClient, err := NewCompletionClient(Options{
 			Primary: VLLMConfig{
 				ChatBaseURL:       chatBaseURL,
 				EmbeddingsBaseURL: embeddingsBaseURL,
@@ -65,8 +75,18 @@ func TestCBClient_E2E(t *testing.T) {
 				EmbeddingModel:    embeddingModel,
 			},
 		})
+		require.NoError(t, err)
+		embeddingClient, err := NewEmbeddingClient(Options{
+			Primary: VLLMConfig{
+				ChatBaseURL:       chatBaseURL,
+				EmbeddingsBaseURL: embeddingsBaseURL,
+				ChatModel:         chatModel,
+				EmbeddingModel:    embeddingModel,
+			},
+		})
+		require.NoError(t, err)
 
-		completion, err := cb.Chat.Completions.New(t.Context(), openai.ChatCompletionNewParams{
+		completion, err := completionClient.New(t.Context(), openai.ChatCompletionNewParams{
 			Messages: []openai.ChatCompletionMessageParamUnion{
 				openai.UserMessage("Reply with exactly: safeagent"),
 			},
@@ -74,7 +94,7 @@ func TestCBClient_E2E(t *testing.T) {
 		require.NoError(t, err)
 		require.NotEmpty(t, completion.Choices)
 
-		embeddings, err := cb.Embeddings.New(t.Context(), openai.EmbeddingNewParams{
+		embeddings, err := embeddingClient.New(t.Context(), openai.EmbeddingNewParams{
 			Input: openai.EmbeddingNewParamsInputUnion{OfString: openai.String("safeagent")},
 		})
 		require.NoError(t, err)
