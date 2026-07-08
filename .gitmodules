@@ -16,3 +16,6 @@
 [submodule "opencode"]
 	path = opencode
 	url = https://github.com/anomalyco/opencode
+[submodule "openai-agents-js"]
+	path = openai-agents-js
+	url = https://github.com/openai/openai-agents-js

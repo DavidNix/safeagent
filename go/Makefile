@@ -6,7 +6,7 @@ help: ## Print this help message
 
 .PHONY: fmt
 fmt: ## Run formatters
-	go tool goimports -w ./...
+	go tool goimports -w .
 	go tool modernize -fix ./...
 
 .PHONY: vet
