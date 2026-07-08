@@ -6,8 +6,12 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -701,6 +705,117 @@ func TestRunner_Run(t *testing.T) {
 
 		require.EqualError(t, err, `agent "assistant" has no model`)
 	})
+
+	t.Run("e2e openrouter client", func(t *testing.T) {
+		skipE2EInShortMode(t)
+		apiKey := requireE2EEnv(t, openRouterAPIKeyEnv)
+		ctx, cancel := e2eContext(t)
+		defer cancel()
+
+		client := llm.NewOpenRouter(llm.OpenRouterConfig{
+			APIKey:    apiKey,
+			ChatModel: openRouterE2EModel,
+			SiteURL:   "https://github.com/DavidNix/safeagent",
+			AppTitle:  "SafeAgent E2E",
+		})
+
+		runE2EAgent(t, ctx, "OpenRouter E2E", client, "SAFEAGENT_OPENROUTER_E2E")
+	})
+
+	t.Run("e2e vllm client", func(t *testing.T) {
+		skipE2EInShortMode(t)
+		baseURL := requireE2EEnv(t, vllmBaseURLEnv)
+		ctx, cancel := e2eContext(t)
+		defer cancel()
+
+		client := newVLLME2EClient(baseURL)
+
+		runE2EAgent(t, ctx, "vLLM E2E", client, "SAFEAGENT_VLLM_E2E")
+	})
+
+	t.Run("e2e circuit breaker falls back to vllm", func(t *testing.T) {
+		skipE2EInShortMode(t)
+		apiKey := requireE2EEnv(t, openRouterAPIKeyEnv)
+		baseURL := requireE2EEnv(t, vllmBaseURLEnv)
+		ctx, cancel := e2eContext(t)
+		defer cancel()
+
+		var primaryHits atomic.Int32
+		primaryServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			primaryHits.Add(1)
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte("primary intentionally unavailable"))
+		}))
+		t.Cleanup(primaryServer.Close)
+
+		primary := llm.NewOpenRouter(llm.OpenRouterConfig{
+			APIKey:    apiKey,
+			BaseURL:   primaryServer.URL,
+			ChatModel: "intentionally-failing-primary",
+		})
+		fallback := newVLLME2EClient(baseURL)
+		breaker := llm.NewCircuitBreakerWithConfig(llm.BreakerConfig{FailureThreshold: 1}, primary, fallback)
+
+		runE2EAgent(t, ctx, "Circuit Breaker E2E", breaker, "SAFEAGENT_CIRCUIT_BREAKER_E2E")
+		require.Equal(t, int32(1), primaryHits.Load())
+	})
+}
+
+const (
+	openRouterAPIKeyEnv        = "OPENROUTER_API_KEY"
+	openRouterE2EModel         = "qwen/qwen3.6-35b-a3b"
+	vllmBaseURLEnv             = "VLLM_BASE_URL"
+	vllmE2EModel               = "qwen3.6-35b-a3b"
+	e2eTimeout                 = 2 * time.Minute
+	e2eAgentMaxCompletionToken = 32
+)
+
+func skipE2EInShortMode(t *testing.T) {
+	t.Helper()
+	if testing.Short() {
+		t.Skip("skipping e2e test in short mode")
+	}
+}
+
+func e2eContext(t *testing.T) (context.Context, context.CancelFunc) {
+	t.Helper()
+	return context.WithTimeout(t.Context(), e2eTimeout)
+}
+
+func requireE2EEnv(t *testing.T, name string) string {
+	t.Helper()
+	value := strings.TrimSpace(os.Getenv(name))
+	require.NotEmpty(t, value, "%s must be set for e2e tests", name)
+	return value
+}
+
+func newVLLME2EClient(baseURL string) *llm.Client {
+	return llm.NewVLLM(llm.VLLMConfig{
+		ChatBaseURL: baseURL,
+		ChatModel:   vllmE2EModel,
+	})
+}
+
+func runE2EAgent(t *testing.T, ctx context.Context, name string, model agent.Model, marker string) *agent.RunResult {
+	t.Helper()
+	temperature := 0.0
+	maxTokens := e2eAgentMaxCompletionToken
+	ag := &agent.Agent{
+		Name:         name,
+		Instructions: "You are running a SafeAgent end-to-end test. Reply with exactly the requested marker and no other text.",
+		Model:        model,
+		ModelSettings: agent.ModelSettings{
+			Temperature: &temperature,
+			MaxTokens:   &maxTokens,
+		},
+	}
+
+	result, err := agent.Run(ctx, ag, "Return exactly this marker: "+marker)
+
+	require.NoError(t, err)
+	require.Contains(t, result.FinalOutput, marker)
+	require.Equal(t, 1, result.Usage.Requests)
+	return result
 }
 
 func TestAgent_AsTool(t *testing.T) {
