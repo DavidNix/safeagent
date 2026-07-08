@@ -344,19 +344,20 @@ func (c *Client) Complete(ctx context.Context, req ChatRequest) (*ChatResponse, 
 			}
 		}
 		resp, err := c.roundTrip(ctx, body)
-		if err == nil {
-			return resp, nil
-		}
-		if !isTriggerError(ctx, err) {
-			return nil, err
-		}
-		lastErr = err
-		if attempt >= c.maxRetries {
-			if c.maxRetries == 0 {
+		if err != nil {
+			if !isTriggerError(ctx, err) {
 				return nil, err
 			}
-			return nil, fmt.Errorf("chat completions failed after %d attempts: %w", attempt+1, lastErr)
+			lastErr = err
+			if attempt >= c.maxRetries {
+				if c.maxRetries == 0 {
+					return nil, err
+				}
+				return nil, fmt.Errorf("chat completions failed after %d attempts: %w", attempt+1, lastErr)
+			}
+			continue
 		}
+		return resp, nil
 	}
 }
 
@@ -459,6 +460,9 @@ func readResponseBody(r io.Reader, limit int64) ([]byte, error) {
 	return body, nil
 }
 
+// isTriggerError reports whether err should trigger retry, fallback, or opening
+// the circuit. It only treats transient provider or transport failures as
+// triggers; caller cancellation and non-retryable API errors are not triggers.
 func isTriggerError(ctx context.Context, err error) bool {
 	if err == nil {
 		return false
