@@ -30,6 +30,11 @@ type Agent struct {
 	InputGuardrails []InputGuardrail
 	// OutputGuardrails run against the final output of the run.
 	OutputGuardrails []OutputGuardrail
+	// DisableToolChoiceReset keeps sending ModelSettings.ToolChoice on every
+	// turn. By default any ToolChoice other than "none" is dropped from
+	// requests once this agent has executed tool calls in the run, so a
+	// forced tool choice cannot loop the run to MaxTurns.
+	DisableToolChoiceReset bool
 }
 
 // AsTool exposes the agent as a function tool that runs the agent to
@@ -51,7 +56,7 @@ func (a *Agent) AsTool(name, description string) Tool {
 			if err := json.Unmarshal([]byte(arguments), &args); err != nil {
 				return "", fmt.Errorf("parse input for agent tool %q: %w", toolName, err)
 			}
-			runner := &Runner{Context: rc.Context}
+			runner := &Runner{Context: rc.Context, Tracer: rc.tracer}
 			result, err := runner.Run(ctx, a, args.Input)
 			if err != nil {
 				return "", fmt.Errorf("run agent %q as tool: %w", a.Name, err)

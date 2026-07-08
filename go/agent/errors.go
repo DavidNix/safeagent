@@ -1,6 +1,9 @@
 package agent
 
-import "fmt"
+import (
+	"fmt"
+	"time"
+)
 
 // MaxTurnsExceededError reports that a run exceeded its turn budget.
 type MaxTurnsExceededError struct {
@@ -43,6 +46,18 @@ func (e *ToolCallError) Error() string {
 // Unwrap returns the underlying tool error.
 func (e *ToolCallError) Unwrap() error {
 	return e.Err
+}
+
+// ToolTimeoutError reports a tool invocation that exceeded its Timeout. Its
+// message doubles as the default model-visible output when the tool does not
+// propagate timeouts.
+type ToolTimeoutError struct {
+	ToolName string
+	Timeout  time.Duration
+}
+
+func (e *ToolTimeoutError) Error() string {
+	return fmt.Sprintf("Tool '%s' timed out after %dms.", e.ToolName, e.Timeout.Milliseconds())
 }
 
 // GuardrailExecutionError reports a guardrail that failed to execute.

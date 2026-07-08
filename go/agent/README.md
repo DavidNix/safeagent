@@ -82,9 +82,25 @@ weather := agent.Tool{
 }
 ```
 
-Tool errors abort the run wrapped in `*ToolCallError`. The `RunContext`
-passed to `OnInvoke` exposes the `Runner.Context` value and the run's
-accumulated `Usage`.
+The `RunContext` passed to `OnInvoke` exposes the `Runner.Context` value and
+the run's accumulated `Usage`.
+
+### Tool errors and timeouts
+
+By default a failed `OnInvoke` does **not** abort the run: the error becomes
+a model-visible tool output ("An error occurred while running the tool.
+Please try again. Error: ...") and the loop continues, so the model can retry
+or work around it. Customize the message with `OnInvokeError`, or set
+`PropagateErrors: true` to abort the run with a `*ToolCallError` instead
+(matching the JS SDK's `errorFunction` semantics).
+
+`Timeout` caps a single invocation. A timed out tool likewise becomes a
+model-visible output (`Tool 'name' timed out after 100ms.`) unless
+`PropagateTimeout: true`, which aborts the run with a `*ToolTimeoutError`;
+`OnTimeout` customizes the message. The invocation's ctx is cancelled at the
+deadline — `OnInvoke` implementations should honor it, because a goroutine
+that ignores ctx leaks until it returns. Cancellation of the run's own
+context is never converted into tool output; it always propagates.
 
 ## Multi-agent coordination
 
@@ -199,6 +215,14 @@ ag.InstructionsFunc = func(ctx context.Context, rc *agent.RunContext, a *agent.A
 `MaxTokens`, `ParallelToolCalls` (nil pointers are omitted from the request),
 and `ToolChoice` (`"auto"`, `"required"`, `"none"`, or a tool name to force).
 
+A forced `ToolChoice` is a one-shot constraint: once an agent has executed
+tool calls in a run, any `ToolChoice` other than `"none"` is dropped from
+subsequent requests so the model can produce a final answer — otherwise a
+`"required"` or named tool choice would force tool calls every turn until
+`MaxTurns`. Tracking is per-agent, so a handoff target's own forced choice is
+still honored on its first call. Set `Agent.DisableToolChoiceReset` to opt
+out (mirrors the JS SDK's `resetToolChoice`).
+
 ## Results, usage, and errors
 
 `RunResult` carries `FinalOutput`, `NewItems` (everything generated),
@@ -208,8 +232,30 @@ and the guardrail results.
 
 Failures are typed — match with `errors.As`: `*MaxTurnsExceededError`,
 `*ModelBehaviorError` (e.g. the model called a nonexistent tool),
-`*ToolCallError`, `*GuardrailExecutionError`, the two tripwire errors, and
-`*UserError` for misconfiguration (nil agent, missing model).
+`*ToolCallError`, `*ToolTimeoutError`, `*GuardrailExecutionError`, the two
+tripwire errors, and `*UserError` for misconfiguration (nil agent, missing
+model).
+
+## Tracing
+
+Inject an optional `Tracer` via `Runner.Tracer` to observe the run lifecycle:
+`RunStarted`, `TurnStarted`, `ModelCallEnded`, `ToolStarted`/`ToolEnded`
+(these two fire from parallel goroutines — implementations must be
+concurrency-safe), `Handoff`, and `RunEnded`. `ToolEnded` reports the raw
+invocation result before error recovery rewrites it for the model. The
+tracer propagates to nested runs started by `Agent.AsTool`.
+
+Embed `NoopTracer` to implement only the methods you need, or use the
+built-in slog adapter:
+
+```go
+runner := &agent.Runner{
+	Tracer: agent.NewSlogTracer(slog.Default()),
+}
+```
+
+`SlogTracer` logs run boundaries and handoffs at info, turns, model calls,
+and tool activity at debug, and failures at error.
 
 ## Custom models and testing
 
@@ -235,6 +281,8 @@ substitute your own fake in tests without any HTTP server at all.
 
 ## Not ported (yet)
 
-Streaming, tracing, sessions/memory, MCP servers, structured output types,
-handoff input filters, human-in-the-loop interruptions, and the Responses
-API transport. The `Model` interface is the seam for most of these.
+Streaming, sessions/memory, MCP servers, structured output types, handoff
+input filters, `toolUseBehavior` (stop-on-first-tool and friends),
+human-in-the-loop interruptions, OpenAI dashboard trace export, and the
+Responses API transport. The `Model` interface is the seam for most of
+these.

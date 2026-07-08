@@ -1,10 +1,15 @@
 package agent_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"log/slog"
+	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/DavidNix/safeagent/agent"
 	"github.com/stretchr/testify/require"
@@ -228,10 +233,11 @@ func TestRunner_Run(t *testing.T) {
 		require.EqualError(t, err, `model behavior error: tool "nope" not found on agent "assistant"`)
 	})
 
-	t.Run("tool call error", func(t *testing.T) {
+	t.Run("tool call error propagated", func(t *testing.T) {
 		kaboom := errors.New("kaboom")
 		tool := agent.Tool{
-			Name: "explode",
+			Name:            "explode",
+			PropagateErrors: true,
 			OnInvoke: func(_ context.Context, _ *agent.RunContext, _ string) (string, error) {
 				return "", kaboom
 			},
@@ -245,6 +251,225 @@ func TestRunner_Run(t *testing.T) {
 
 		require.EqualError(t, err, `tool "explode" failed: kaboom`)
 		require.ErrorIs(t, err, kaboom)
+	})
+
+	t.Run("tool error recovered by default", func(t *testing.T) {
+		tool := agent.Tool{
+			Name: "explode",
+			OnInvoke: func(_ context.Context, _ *agent.RunContext, _ string) (string, error) {
+				return "", errors.New("kaboom")
+			},
+		}
+		model := &fakeModel{responses: []agent.ModelResponse{
+			{Output: []agent.Item{agent.ToolCall{ID: "call_1", Name: "explode", Arguments: "{}"}}},
+			{Output: []agent.Item{agent.AssistantMessage("recovered")}},
+		}}
+		ag := &agent.Agent{Name: "assistant", Model: model, Tools: []agent.Tool{tool}}
+
+		result, err := agent.Run(t.Context(), ag, "Hi")
+
+		require.NoError(t, err)
+		require.Equal(t, "recovered", result.FinalOutput)
+		require.Contains(t, model.requests[1].Input, agent.Item(agent.ToolOutput{
+			CallID: "call_1",
+			Name:   "explode",
+			Output: "An error occurred while running the tool. Please try again. Error: kaboom",
+		}))
+	})
+
+	t.Run("tool error custom handler", func(t *testing.T) {
+		tool := agent.Tool{
+			Name: "explode",
+			OnInvoke: func(_ context.Context, _ *agent.RunContext, _ string) (string, error) {
+				return "", errors.New("kaboom")
+			},
+			OnInvokeError: func(_ context.Context, _ *agent.RunContext, err error) string {
+				return "custom recovery: " + err.Error()
+			},
+		}
+		model := &fakeModel{responses: []agent.ModelResponse{
+			{Output: []agent.Item{agent.ToolCall{ID: "call_1", Name: "explode", Arguments: "{}"}}},
+			{Output: []agent.Item{agent.AssistantMessage("ok")}},
+		}}
+		ag := &agent.Agent{Name: "assistant", Model: model, Tools: []agent.Tool{tool}}
+
+		_, err := agent.Run(t.Context(), ag, "Hi")
+
+		require.NoError(t, err)
+		require.Contains(t, model.requests[1].Input, agent.Item(agent.ToolOutput{
+			CallID: "call_1",
+			Name:   "explode",
+			Output: "custom recovery: kaboom",
+		}))
+	})
+
+	t.Run("tool timeout recovered by default", func(t *testing.T) {
+		tool := agent.Tool{
+			Name:    "slow",
+			Timeout: 10 * time.Millisecond,
+			OnInvoke: func(ctx context.Context, _ *agent.RunContext, _ string) (string, error) {
+				<-ctx.Done()
+				return "", ctx.Err()
+			},
+		}
+		model := &fakeModel{responses: []agent.ModelResponse{
+			{Output: []agent.Item{agent.ToolCall{ID: "call_1", Name: "slow", Arguments: "{}"}}},
+			{Output: []agent.Item{agent.AssistantMessage("moving on")}},
+		}}
+		ag := &agent.Agent{Name: "assistant", Model: model, Tools: []agent.Tool{tool}}
+
+		result, err := agent.Run(t.Context(), ag, "Hi")
+
+		require.NoError(t, err)
+		require.Equal(t, "moving on", result.FinalOutput)
+		require.Contains(t, model.requests[1].Input, agent.Item(agent.ToolOutput{
+			CallID: "call_1",
+			Name:   "slow",
+			Output: "Tool 'slow' timed out after 10ms.",
+		}))
+	})
+
+	t.Run("tool timeout propagated", func(t *testing.T) {
+		tool := agent.Tool{
+			Name:             "slow",
+			Timeout:          10 * time.Millisecond,
+			PropagateTimeout: true,
+			OnInvoke: func(ctx context.Context, _ *agent.RunContext, _ string) (string, error) {
+				<-ctx.Done()
+				return "", ctx.Err()
+			},
+		}
+		model := &fakeModel{responses: []agent.ModelResponse{
+			{Output: []agent.Item{agent.ToolCall{ID: "call_1", Name: "slow", Arguments: "{}"}}},
+		}}
+		ag := &agent.Agent{Name: "assistant", Model: model, Tools: []agent.Tool{tool}}
+
+		_, err := agent.Run(t.Context(), ag, "Hi")
+
+		require.EqualError(t, err, "Tool 'slow' timed out after 10ms.")
+		var timeoutErr *agent.ToolTimeoutError
+		require.ErrorAs(t, err, &timeoutErr)
+		require.Equal(t, "slow", timeoutErr.ToolName)
+	})
+
+	t.Run("tool choice reset after tool use", func(t *testing.T) {
+		model := &fakeModel{responses: []agent.ModelResponse{
+			{Output: []agent.Item{agent.ToolCall{ID: "call_1", Name: "loop", Arguments: "{}"}}},
+			{Output: []agent.Item{agent.AssistantMessage("done")}},
+		}}
+		ag := &agent.Agent{
+			Name:          "assistant",
+			Model:         model,
+			Tools:         []agent.Tool{loopTool()},
+			ModelSettings: agent.ModelSettings{ToolChoice: "required"},
+		}
+
+		_, err := agent.Run(t.Context(), ag, "go")
+
+		require.NoError(t, err)
+		require.Equal(t, "required", model.requests[0].ModelSettings.ToolChoice)
+		require.Equal(t, "", model.requests[1].ModelSettings.ToolChoice)
+	})
+
+	t.Run("tool choice reset disabled", func(t *testing.T) {
+		model := &fakeModel{responses: []agent.ModelResponse{
+			{Output: []agent.Item{agent.ToolCall{ID: "call_1", Name: "loop", Arguments: "{}"}}},
+			{Output: []agent.Item{agent.AssistantMessage("done")}},
+		}}
+		ag := &agent.Agent{
+			Name:                   "assistant",
+			Model:                  model,
+			Tools:                  []agent.Tool{loopTool()},
+			ModelSettings:          agent.ModelSettings{ToolChoice: "required"},
+			DisableToolChoiceReset: true,
+		}
+
+		_, err := agent.Run(t.Context(), ag, "go")
+
+		require.NoError(t, err)
+		require.Equal(t, "required", model.requests[1].ModelSettings.ToolChoice)
+	})
+
+	t.Run("tool choice none never reset", func(t *testing.T) {
+		model := &fakeModel{responses: []agent.ModelResponse{
+			{Output: []agent.Item{agent.ToolCall{ID: "call_1", Name: "loop", Arguments: "{}"}}},
+			{Output: []agent.Item{agent.AssistantMessage("done")}},
+		}}
+		ag := &agent.Agent{
+			Name:          "assistant",
+			Model:         model,
+			Tools:         []agent.Tool{loopTool()},
+			ModelSettings: agent.ModelSettings{ToolChoice: "none"},
+		}
+
+		_, err := agent.Run(t.Context(), ag, "go")
+
+		require.NoError(t, err)
+		require.Equal(t, "none", model.requests[1].ModelSettings.ToolChoice)
+	})
+
+	t.Run("tracer events", func(t *testing.T) {
+		model := &fakeModel{responses: []agent.ModelResponse{
+			{Output: []agent.Item{agent.ToolCall{ID: "call_1", Name: "loop", Arguments: "{}"}}},
+			{Output: []agent.Item{agent.AssistantMessage("done")}},
+		}}
+		ag := &agent.Agent{Name: "assistant", Model: model, Tools: []agent.Tool{loopTool()}}
+
+		tracer := &recordingTracer{}
+		runner := &agent.Runner{Tracer: tracer}
+		_, err := runner.Run(t.Context(), ag, "go")
+
+		require.NoError(t, err)
+		require.Equal(t, []string{
+			"run_started:assistant",
+			"turn_started:1",
+			"model_call_ended",
+			"tool_started:loop",
+			"tool_ended:loop",
+			"turn_started:2",
+			"model_call_ended",
+			"run_ended",
+		}, tracer.log())
+	})
+
+	t.Run("tracer handoff event", func(t *testing.T) {
+		spanish := &agent.Agent{Name: "Spanish agent", Model: &fakeModel{responses: []agent.ModelResponse{
+			{Output: []agent.Item{agent.AssistantMessage("¡Hola!")}},
+		}}}
+		triage := &agent.Agent{
+			Name: "Triage",
+			Model: &fakeModel{responses: []agent.ModelResponse{
+				{Output: []agent.Item{agent.ToolCall{ID: "call_1", Name: "transfer_to_Spanish_agent", Arguments: "{}"}}},
+			}},
+			Handoffs: []agent.Handoff{agent.HandoffTo(spanish)},
+		}
+
+		tracer := &recordingTracer{}
+		runner := &agent.Runner{Tracer: tracer}
+		_, err := runner.Run(t.Context(), triage, "Hola")
+
+		require.NoError(t, err)
+		require.Equal(t, []string{
+			"run_started:Triage",
+			"turn_started:1",
+			"model_call_ended",
+			"handoff:Triage->Spanish agent",
+			"turn_started:2",
+			"model_call_ended",
+			"run_ended",
+		}, tracer.log())
+	})
+
+	t.Run("tracer run ended with error", func(t *testing.T) {
+		ag := &agent.Agent{Name: "assistant", Model: &fakeModel{}}
+
+		tracer := &recordingTracer{}
+		runner := &agent.Runner{Tracer: tracer}
+		_, err := runner.Run(t.Context(), ag, "Hi")
+
+		require.Error(t, err)
+		events := tracer.log()
+		require.Equal(t, "run_ended_error", events[len(events)-1])
 	})
 
 	t.Run("model error", func(t *testing.T) {
@@ -362,10 +587,11 @@ func TestAgent_AsTool(t *testing.T) {
 		require.Equal(t, agent.Usage{Requests: 3, TotalTokens: 22}, result.Usage)
 	})
 
-	t.Run("invalid tool input", func(t *testing.T) {
+	t.Run("invalid tool input recovered", func(t *testing.T) {
 		inner := &agent.Agent{Name: "Summarizer", Model: &fakeModel{}}
 		outerModel := &fakeModel{responses: []agent.ModelResponse{
 			{Output: []agent.Item{agent.ToolCall{ID: "call_1", Name: "Summarizer", Arguments: "not json"}}},
+			{Output: []agent.Item{agent.AssistantMessage("could not summarize")}},
 		}}
 		outer := &agent.Agent{
 			Name:  "Writer",
@@ -373,8 +599,119 @@ func TestAgent_AsTool(t *testing.T) {
 			Tools: []agent.Tool{inner.AsTool("", "Summarize text")},
 		}
 
-		_, err := agent.Run(t.Context(), outer, "Summarize this")
+		result, err := agent.Run(t.Context(), outer, "Summarize this")
 
-		require.ErrorContains(t, err, `tool "Summarizer" failed: parse input for agent tool "Summarizer"`)
+		require.NoError(t, err)
+		require.Equal(t, "could not summarize", result.FinalOutput)
+		require.Len(t, outerModel.requests, 2)
+		output, ok := findToolOutput(outerModel.requests[1].Input, "call_1")
+		require.True(t, ok)
+		require.Contains(t, output.Output, `parse input for agent tool "Summarizer"`)
+	})
+}
+
+func findToolOutput(items []agent.Item, callID string) (agent.ToolOutput, bool) {
+	for _, item := range items {
+		output, ok := item.(agent.ToolOutput)
+		if ok && output.CallID == callID {
+			return output, true
+		}
+	}
+	return agent.ToolOutput{}, false
+}
+
+func loopTool() agent.Tool {
+	return agent.Tool{
+		Name: "loop",
+		OnInvoke: func(_ context.Context, _ *agent.RunContext, _ string) (string, error) {
+			return "ok", nil
+		},
+	}
+}
+
+type recordingTracer struct {
+	agent.NoopTracer
+	mu     sync.Mutex
+	events []string
+}
+
+func (t *recordingTracer) record(event string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.events = append(t.events, event)
+}
+
+func (t *recordingTracer) log() []string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return append([]string(nil), t.events...)
+}
+
+func (t *recordingTracer) RunStarted(_ context.Context, a *agent.Agent, _ []agent.Item) {
+	t.record("run_started:" + a.Name)
+}
+
+func (t *recordingTracer) TurnStarted(_ context.Context, _ *agent.Agent, turn int) {
+	t.record(fmt.Sprintf("turn_started:%d", turn))
+}
+
+func (t *recordingTracer) ModelCallEnded(_ context.Context, _ *agent.Agent, _ agent.ModelRequest, _ *agent.ModelResponse, _ error) {
+	t.record("model_call_ended")
+}
+
+func (t *recordingTracer) ToolStarted(_ context.Context, _ *agent.Agent, call agent.ToolCall) {
+	t.record("tool_started:" + call.Name)
+}
+
+func (t *recordingTracer) ToolEnded(_ context.Context, _ *agent.Agent, call agent.ToolCall, _ string, _ error) {
+	t.record("tool_ended:" + call.Name)
+}
+
+func (t *recordingTracer) Handoff(_ context.Context, from *agent.Agent, to *agent.Agent) {
+	t.record(fmt.Sprintf("handoff:%s->%s", from.Name, to.Name))
+}
+
+func (t *recordingTracer) RunEnded(_ context.Context, _ *agent.RunResult, err error) {
+	switch err {
+	case nil:
+		t.record("run_ended")
+	default:
+		t.record("run_ended_error")
+	}
+}
+
+func TestSlogTracer(t *testing.T) {
+	t.Parallel()
+
+	t.Run("happy path", func(t *testing.T) {
+		var buf bytes.Buffer
+		logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+		model := &fakeModel{responses: []agent.ModelResponse{
+			{Output: []agent.Item{agent.ToolCall{ID: "call_1", Name: "loop", Arguments: "{}"}}},
+			{Output: []agent.Item{agent.AssistantMessage("done")}, Usage: agent.Usage{Requests: 1, TotalTokens: 9}},
+		}}
+		ag := &agent.Agent{Name: "assistant", Model: model, Tools: []agent.Tool{loopTool()}}
+
+		runner := &agent.Runner{Tracer: agent.NewSlogTracer(logger)}
+		_, err := runner.Run(t.Context(), ag, "go")
+
+		require.NoError(t, err)
+		logged := buf.String()
+		for _, want := range []string{"Run started", "Turn started", "Model call completed", "Tool started", "Tool completed", "Run completed"} {
+			require.True(t, strings.Contains(logged, want), "missing %q in logs:\n%s", want, logged)
+		}
+	})
+
+	t.Run("run error", func(t *testing.T) {
+		var buf bytes.Buffer
+		logger := slog.New(slog.NewTextHandler(&buf, nil))
+		ag := &agent.Agent{Name: "assistant", Model: &fakeModel{}}
+
+		runner := &agent.Runner{Tracer: agent.NewSlogTracer(logger)}
+		_, err := runner.Run(t.Context(), ag, "Hi")
+
+		require.Error(t, err)
+		require.Contains(t, buf.String(), "Model call failed")
+		require.Contains(t, buf.String(), "Run failed")
 	})
 }

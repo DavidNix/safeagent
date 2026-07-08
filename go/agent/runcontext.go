@@ -8,6 +8,8 @@ type RunContext struct {
 	// Context is the value supplied via Runner.Context.
 	Context any
 
+	tracer Tracer
+
 	mu    sync.Mutex
 	usage Usage
 }
