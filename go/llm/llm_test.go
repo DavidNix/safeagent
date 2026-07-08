@@ -23,6 +23,28 @@ func TestClient_Complete(t *testing.T) {
 		require.Equal(t, "https://openrouter.ai/api/v1", llm.DefaultBaseURL)
 	})
 
+	t.Run("e2e openrouter client", func(t *testing.T) {
+		skipE2EInShortMode(t)
+		apiKey := requireE2EEnv(t, openRouterAPIKeyEnv)
+		ctx, cancel := e2eContext(t)
+		defer cancel()
+
+		client := newOpenRouterE2EClient(apiKey, "")
+
+		runLLME2ECompletion(t, ctx, client, "SAFEAGENT_LLM_OPENROUTER_E2E")
+	})
+
+	t.Run("e2e vllm client", func(t *testing.T) {
+		skipE2EInShortMode(t)
+		baseURL := requireE2EEnv(t, vllmBaseURLEnv)
+		ctx, cancel := e2eContext(t)
+		defer cancel()
+
+		client := newVLLME2EClient(t, ctx, baseURL)
+
+		runLLME2ECompletion(t, ctx, client, "SAFEAGENT_LLM_VLLM_E2E")
+	})
+
 	t.Run("happy path sends chat completion request and decodes api response", func(t *testing.T) {
 		request := &capturedRequest{}
 		server := chatCompletionServer(t, http.StatusOK, "It is sunny.", request, nil)
@@ -262,7 +284,57 @@ func TestClient_Complete(t *testing.T) {
 	})
 }
 
+func TestClient_Models(t *testing.T) {
+	t.Parallel()
+
+	t.Run("happy path", func(t *testing.T) {
+		request := &capturedRequest{}
+		server := modelsServer(t, http.StatusOK, `{
+			"object":"list",
+			"data":[{"id":"qwen3.6-35b-a3b-nvfp4","object":"model","created":123,"owned_by":"vllm"}]
+		}`, request)
+		t.Cleanup(server.Close)
+
+		client := llm.NewClient("ignored",
+			llm.WithBaseURL(server.URL),
+			llm.WithAPIKey("test-key"),
+			llm.WithHeaders(map[string]string{"X-Test-Header": "yes"}),
+			llm.WithQueryParams(map[string]string{"backend": "vllm"}),
+		)
+
+		resp, err := client.Models(t.Context())
+
+		require.NoError(t, err)
+		require.Equal(t, http.MethodGet, request.Method)
+		require.Equal(t, "/models", request.Path)
+		require.Equal(t, "Bearer test-key", request.Header.Get("Authorization"))
+		require.Equal(t, "yes", request.Header.Get("X-Test-Header"))
+		require.Equal(t, "vllm", request.Query.Get("backend"))
+		require.Equal(t, &llm.ModelsResponse{
+			Object: "list",
+			Data: []llm.ModelInfo{{
+				ID:      "qwen3.6-35b-a3b-nvfp4",
+				Object:  "model",
+				Created: 123,
+				OwnedBy: "vllm",
+			}},
+		}, resp)
+	})
+
+	t.Run("status error", func(t *testing.T) {
+		server := modelsServer(t, http.StatusServiceUnavailable, "down", nil)
+		t.Cleanup(server.Close)
+
+		client := llm.NewClient("ignored", llm.WithBaseURL(server.URL))
+
+		_, err := client.Models(t.Context())
+
+		require.EqualError(t, err, "models returned status 503: down")
+	})
+}
+
 type capturedRequest struct {
+	Method   string
 	Path     string
 	Query    url.Values
 	Header   http.Header
@@ -286,6 +358,29 @@ func chatCompletionServer(t *testing.T, status int, content string, captured *ca
 	}))
 }
 
+func modelsServer(t *testing.T, status int, body string, captured *capturedRequest) *httptest.Server {
+	t.Helper()
+
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		bodyBytes, err := io.ReadAll(r.Body)
+		require.NoError(t, err)
+		if captured != nil {
+			captured.Method = r.Method
+			captured.Path = r.URL.Path
+			captured.Query = r.URL.Query()
+			captured.Header = r.Header.Clone()
+			captured.Body = bodyBytes
+		}
+		if status >= http.StatusBadRequest {
+			w.WriteHeader(status)
+			_, _ = w.Write([]byte(body))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(body))
+	}))
+}
+
 func captureJSONRequest(t *testing.T, r *http.Request, captured *capturedRequest) {
 	t.Helper()
 
@@ -296,6 +391,7 @@ func captureJSONRequest(t *testing.T, r *http.Request, captured *capturedRequest
 	if captured == nil {
 		return
 	}
+	captured.Method = r.Method
 	captured.Path = r.URL.Path
 	captured.Query = r.URL.Query()
 	captured.Header = r.Header.Clone()

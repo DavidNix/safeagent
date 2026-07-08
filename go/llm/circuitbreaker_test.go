@@ -33,6 +33,29 @@ func TestCircuitBreaker_Complete(t *testing.T) {
 		require.Equal(t, "fallback", fallbackRequest.JSONBody["model"])
 	})
 
+	t.Run("e2e primary failure falls back to vllm", func(t *testing.T) {
+		skipE2EInShortMode(t)
+		apiKey := requireE2EEnv(t, openRouterAPIKeyEnv)
+		baseURL := requireE2EEnv(t, vllmBaseURLEnv)
+		ctx, cancel := e2eContext(t)
+		defer cancel()
+
+		var primaryHits atomic.Int32
+		primaryServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			primaryHits.Add(1)
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte("primary intentionally unavailable"))
+		}))
+		t.Cleanup(primaryServer.Close)
+
+		primary := newOpenRouterE2EClient(apiKey, primaryServer.URL)
+		fallback := newVLLME2EClient(t, ctx, baseURL)
+		breaker := llm.NewCircuitBreakerWithConfig(llm.BreakerConfig{FailureThreshold: 1}, primary, fallback)
+
+		runLLME2ECompletion(t, ctx, breaker, "SAFEAGENT_LLM_CIRCUIT_BREAKER_E2E")
+		require.Equal(t, int32(1), primaryHits.Load())
+	})
+
 	t.Run("non-trigger primary error does not fall back", func(t *testing.T) {
 		primaryServer := chatCompletionServer(t, http.StatusBadRequest, "", nil, nil)
 		t.Cleanup(primaryServer.Close)

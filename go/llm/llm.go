@@ -295,6 +295,20 @@ type ChatResponse struct {
 	Usage   ChatUsage    `json:"usage"`
 }
 
+// ModelInfo describes one model returned by an OpenAI-compatible Models API.
+type ModelInfo struct {
+	ID      string `json:"id"`
+	Object  string `json:"object,omitempty"`
+	Created int64  `json:"created,omitempty"`
+	OwnedBy string `json:"owned_by,omitempty"`
+}
+
+// ModelsResponse is the OpenAI-compatible Models API response.
+type ModelsResponse struct {
+	Object string      `json:"object"`
+	Data   []ModelInfo `json:"data"`
+}
+
 // StatusError reports a non-200 response from the Chat Completions API.
 type StatusError struct {
 	StatusCode int
@@ -361,6 +375,42 @@ func (c *Client) Complete(ctx context.Context, req ChatRequest) (*ChatResponse, 
 	}
 }
 
+// Models returns the models advertised by the configured OpenAI-compatible API.
+func (c *Client) Models(ctx context.Context) (*ModelsResponse, error) {
+	endpoint, err := c.endpoint("models")
+	if err != nil {
+		return nil, err
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, fmt.Errorf("build models request: %w", err)
+	}
+	httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
+	for key, value := range c.headers {
+		httpReq.Header.Set(key, value)
+	}
+
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("call models: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	respBody, err := readResponseBody(resp.Body, c.maxRespBody)
+	if err != nil {
+		return nil, fmt.Errorf("read models response: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, &modelsStatusError{StatusCode: resp.StatusCode, Body: string(respBody)}
+	}
+
+	var parsed ModelsResponse
+	if err := json.Unmarshal(respBody, &parsed); err != nil {
+		return nil, fmt.Errorf("decode models response: %w", err)
+	}
+	return &parsed, nil
+}
+
 func (c *Client) marshalRequest(req ChatRequest) ([]byte, error) {
 	body, err := json.Marshal(wireChatRequest{Model: c.model, ChatRequest: req})
 	if err != nil {
@@ -390,7 +440,7 @@ func (c *Client) backoff(attempt int, lastErr error) time.Duration {
 }
 
 func (c *Client) roundTrip(ctx context.Context, body []byte) (*ChatResponse, error) {
-	endpoint, err := c.endpoint()
+	endpoint, err := c.endpoint("chat/completions")
 	if err != nil {
 		return nil, err
 	}
@@ -429,8 +479,8 @@ func (c *Client) roundTrip(ctx context.Context, body []byte) (*ChatResponse, err
 	return &parsed, nil
 }
 
-func (c *Client) endpoint() (string, error) {
-	endpoint := c.baseURL + "/chat/completions"
+func (c *Client) endpoint(path string) (string, error) {
+	endpoint := c.baseURL + "/" + strings.TrimPrefix(path, "/")
 	if len(c.queryParams) == 0 {
 		return endpoint, nil
 	}
@@ -444,6 +494,19 @@ func (c *Client) endpoint() (string, error) {
 	}
 	req.URL.RawQuery = q.Encode()
 	return req.URL.String(), nil
+}
+
+type modelsStatusError struct {
+	StatusCode int
+	Body       string
+}
+
+func (e *modelsStatusError) Error() string {
+	body := strings.TrimSpace(e.Body)
+	if body == "" {
+		return fmt.Sprintf("models returned status %d", e.StatusCode)
+	}
+	return fmt.Sprintf("models returned status %d: %s", e.StatusCode, body)
 }
 
 func readResponseBody(r io.Reader, limit int64) ([]byte, error) {
