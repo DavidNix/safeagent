@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"slices"
 
+	"github.com/DavidNix/safeagent/llm"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -83,23 +84,22 @@ func (r *Runner) runItems(ctx context.Context, tracer Tracer, agent *Agent, inpu
 		if !current.DisableToolChoiceReset && usedTools[current] && settings.ToolChoice != "none" {
 			settings.ToolChoice = ""
 		}
-		req := ModelRequest{
-			SystemInstructions: instructions,
-			Input:              history,
-			ModelSettings:      settings,
-			Tools:              current.toolDefinitions(),
-			Handoffs:           current.handoffDefinitions(),
+		req := buildChatRequest(instructions, history, settings, current.toolDefinitions(), current.handoffDefinitions())
+		resp, err := current.Model.Complete(ctx, req)
+		if err != nil {
+			tracer.ModelCallEnded(ctx, current, req, resp, err)
+			return nil, fmt.Errorf("model response for agent %q: %w", current.Name, err)
 		}
-		resp, err := current.Model.GetResponse(ctx, req)
+		output, usage, err := parseChatResponse(resp)
 		tracer.ModelCallEnded(ctx, current, req, resp, err)
 		if err != nil {
 			return nil, fmt.Errorf("model response for agent %q: %w", current.Name, err)
 		}
-		rc.AddUsage(resp.Usage)
-		history = append(history, resp.Output...)
-		result.NewItems = append(result.NewItems, resp.Output...)
+		rc.AddUsage(usage)
+		history = append(history, output...)
+		result.NewItems = append(result.NewItems, output...)
 
-		next, outputs, err := processTurn(ctx, rc, tracer, current, resp.Output)
+		next, outputs, err := processTurn(ctx, rc, tracer, current, output)
 		if err != nil {
 			return nil, err
 		}
@@ -117,7 +117,7 @@ func (r *Runner) runItems(ctx context.Context, tracer Tracer, agent *Agent, inpu
 			continue
 		}
 
-		result.FinalOutput = lastAssistantText(resp.Output)
+		result.FinalOutput = lastAssistantText(output)
 		result.History = history
 		result.Usage = rc.Usage()
 		outputResults, err := runOutputGuardrails(ctx, rc, current, result.FinalOutput)
@@ -128,6 +128,132 @@ func (r *Runner) runItems(ctx context.Context, tracer Tracer, agent *Agent, inpu
 		return result, nil
 	}
 	return nil, &MaxTurnsExceededError{MaxTurns: maxTurns}
+}
+
+func buildChatRequest(instructions string, input []Item, settings ModelSettings, tools []ToolDefinition, handoffs []HandoffDefinition) llm.ChatRequest {
+	return llm.ChatRequest{
+		Messages:          buildChatMessages(instructions, input),
+		Tools:             buildChatTools(tools, handoffs),
+		Temperature:       settings.Temperature,
+		TopP:              settings.TopP,
+		MaxTokens:         settings.MaxTokens,
+		ParallelToolCalls: settings.ParallelToolCalls,
+		ToolChoice:        toolChoiceValue(settings.ToolChoice),
+	}
+}
+
+func buildChatMessages(instructions string, input []Item) []llm.ChatMessage {
+	var messages []llm.ChatMessage
+	if instructions != "" {
+		messages = append(messages, llm.ChatMessage{Role: "system", Content: instructions})
+	}
+	var pendingCalls []llm.ChatToolCall
+	flush := func() {
+		if len(pendingCalls) > 0 {
+			messages = append(messages, llm.ChatMessage{Role: "assistant", ToolCalls: pendingCalls})
+			pendingCalls = nil
+		}
+	}
+	for _, item := range input {
+		switch v := item.(type) {
+		case Message:
+			flush()
+			messages = append(messages, llm.ChatMessage{Role: string(v.Role), Content: v.Content})
+		case ToolCall:
+			pendingCalls = append(pendingCalls, llm.ChatToolCall{
+				ID:       v.ID,
+				Type:     "function",
+				Function: llm.ChatFunctionCall{Name: v.Name, Arguments: v.Arguments},
+			})
+		case ToolOutput:
+			flush()
+			messages = append(messages, llm.ChatMessage{Role: "tool", Content: v.Output, ToolCallID: v.CallID})
+		case Reasoning:
+			// Reasoning traces are output-only and never replayed to the model.
+		}
+	}
+	flush()
+	return messages
+}
+
+func buildChatTools(tools []ToolDefinition, handoffs []HandoffDefinition) []llm.ChatTool {
+	chatTools := make([]llm.ChatTool, 0, len(tools)+len(handoffs))
+	for _, tool := range tools {
+		chatTools = append(chatTools, llm.ChatTool{
+			Type: "function",
+			Function: llm.ChatFunctionDefinition{
+				Name:        tool.Name,
+				Description: tool.Description,
+				Parameters:  tool.Parameters,
+				Strict:      tool.Strict,
+			},
+		})
+	}
+	for _, handoff := range handoffs {
+		chatTools = append(chatTools, llm.ChatTool{
+			Type: "function",
+			Function: llm.ChatFunctionDefinition{
+				Name:        handoff.ToolName,
+				Description: handoff.ToolDescription,
+				Parameters:  handoff.InputSchema,
+			},
+		})
+	}
+	if len(chatTools) == 0 {
+		return nil
+	}
+	return chatTools
+}
+
+func toolChoiceValue(choice string) any {
+	switch choice {
+	case "":
+		return nil
+	case "auto", "required", "none":
+		return choice
+	default:
+		return map[string]any{
+			"type":     "function",
+			"function": map[string]any{"name": choice},
+		}
+	}
+}
+
+func parseChatResponse(resp *llm.ChatResponse) ([]Item, Usage, error) {
+	if resp == nil {
+		return nil, Usage{}, errors.New("chat completions returned nil response")
+	}
+	usage := Usage{
+		Requests:     1,
+		InputTokens:  resp.Usage.PromptTokens,
+		OutputTokens: resp.Usage.CompletionTokens,
+		TotalTokens:  resp.Usage.TotalTokens,
+	}
+	if len(resp.Choices) == 0 {
+		return nil, usage, errors.New("chat completions returned no choices")
+	}
+
+	choice := resp.Choices[0]
+	if choice.Message.Refusal != "" {
+		return nil, usage, &ModelBehaviorError{Message: "model refused to produce output: " + choice.Message.Refusal}
+	}
+
+	var output []Item
+	if choice.Message.ReasoningContent != "" {
+		output = append(output, Reasoning{Content: choice.Message.ReasoningContent})
+	}
+	if choice.Message.Content != "" {
+		output = append(output, AssistantMessage(choice.Message.Content))
+	}
+	for _, call := range choice.Message.ToolCalls {
+		output = append(output, ToolCall{
+			ID:        call.ID,
+			Name:      call.Function.Name,
+			Arguments: call.Function.Arguments,
+		})
+	}
+
+	return output, usage, nil
 }
 
 type pendingToolCall struct {

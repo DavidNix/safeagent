@@ -3,6 +3,8 @@ package agent
 import (
 	"context"
 	"encoding/json"
+
+	"github.com/DavidNix/safeagent/llm"
 )
 
 // ToolDefinition is the serialized form of a tool sent to the model.
@@ -20,24 +22,9 @@ type HandoffDefinition struct {
 	InputSchema     json.RawMessage
 }
 
-// ModelRequest is a single request to a language model.
-type ModelRequest struct {
-	SystemInstructions string
-	Input              []Item
-	ModelSettings      ModelSettings
-	Tools              []ToolDefinition
-	Handoffs           []HandoffDefinition
-}
-
-// ModelResponse is the model output for a single request.
-type ModelResponse struct {
-	Output     []Item
-	Usage      Usage
-	ResponseID string
-}
-
-// Model is the interface for calling a language model.
+// Model is the agent call-site interface for an OpenAI-compatible Chat
+// Completions model.
 type Model interface {
-	// GetResponse returns a single response for the request.
-	GetResponse(ctx context.Context, req ModelRequest) (*ModelResponse, error)
+	// Complete returns a single Chat Completions response for the request.
+	Complete(ctx context.Context, req llm.ChatRequest) (*llm.ChatResponse, error)
 }

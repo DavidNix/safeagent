@@ -12,35 +12,164 @@ import (
 	"time"
 
 	"github.com/DavidNix/safeagent/agent"
+	"github.com/DavidNix/safeagent/llm"
 	"github.com/stretchr/testify/require"
 )
 
 type fakeModel struct {
-	mu        sync.Mutex
-	responses []agent.ModelResponse
-	requests  []agent.ModelRequest
+	mu          sync.Mutex
+	responses   []fakeModelResponse
+	requests    []capturedModelRequest
+	rawRequests []llm.ChatRequest
 }
 
-func (m *fakeModel) GetResponse(_ context.Context, req agent.ModelRequest) (*agent.ModelResponse, error) {
+type fakeModelResponse struct {
+	Output     []agent.Item
+	Usage      agent.Usage
+	ResponseID string
+	Raw        *llm.ChatResponse
+}
+
+type capturedModelRequest struct {
+	SystemInstructions string
+	Input              []agent.Item
+	ModelSettings      agent.ModelSettings
+	Tools              []agent.ToolDefinition
+	Handoffs           []agent.HandoffDefinition
+}
+
+func (m *fakeModel) Complete(_ context.Context, req llm.ChatRequest) (*llm.ChatResponse, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	snapshot := req
-	snapshot.Input = make([]agent.Item, len(req.Input))
-	copy(snapshot.Input, req.Input)
-	m.requests = append(m.requests, snapshot)
+	m.rawRequests = append(m.rawRequests, cloneChatRequest(req))
+	m.requests = append(m.requests, captureModelRequest(req))
 	if len(m.responses) == 0 {
 		return nil, errors.New("fake model has no scripted responses")
 	}
 	resp := m.responses[0]
 	m.responses = m.responses[1:]
-	return &resp, nil
+	if resp.Raw != nil {
+		return resp.Raw, nil
+	}
+	return chatResponseFromItems(resp), nil
+}
+
+func cloneChatRequest(req llm.ChatRequest) llm.ChatRequest {
+	req.Messages = append([]llm.ChatMessage(nil), req.Messages...)
+	req.Tools = append([]llm.ChatTool(nil), req.Tools...)
+	return req
+}
+
+func captureModelRequest(req llm.ChatRequest) capturedModelRequest {
+	captured := capturedModelRequest{
+		ModelSettings: agent.ModelSettings{
+			Temperature:       req.Temperature,
+			TopP:              req.TopP,
+			MaxTokens:         req.MaxTokens,
+			ParallelToolCalls: req.ParallelToolCalls,
+			ToolChoice:        toolChoiceString(req.ToolChoice),
+		},
+	}
+	toolNamesByCallID := map[string]string{}
+	for _, msg := range req.Messages {
+		switch msg.Role {
+		case "system":
+			if captured.SystemInstructions == "" {
+				captured.SystemInstructions = msg.Content
+				continue
+			}
+			captured.Input = append(captured.Input, agent.SystemMessage(msg.Content))
+		case "user", "assistant":
+			if msg.Content != "" {
+				captured.Input = append(captured.Input, agent.Message{Role: agent.Role(msg.Role), Content: msg.Content})
+			}
+			for _, call := range msg.ToolCalls {
+				toolNamesByCallID[call.ID] = call.Function.Name
+				captured.Input = append(captured.Input, agent.ToolCall{
+					ID:        call.ID,
+					Name:      call.Function.Name,
+					Arguments: call.Function.Arguments,
+				})
+			}
+		case "tool":
+			captured.Input = append(captured.Input, agent.ToolOutput{
+				CallID: msg.ToolCallID,
+				Name:   toolNamesByCallID[msg.ToolCallID],
+				Output: msg.Content,
+			})
+		}
+	}
+	for _, tool := range req.Tools {
+		if strings.HasPrefix(tool.Function.Name, "transfer_to_") {
+			captured.Handoffs = append(captured.Handoffs, agent.HandoffDefinition{
+				ToolName:        tool.Function.Name,
+				ToolDescription: tool.Function.Description,
+				InputSchema:     tool.Function.Parameters,
+			})
+			continue
+		}
+		captured.Tools = append(captured.Tools, agent.ToolDefinition{
+			Name:        tool.Function.Name,
+			Description: tool.Function.Description,
+			Parameters:  tool.Function.Parameters,
+			Strict:      tool.Function.Strict,
+		})
+	}
+	return captured
+}
+
+func toolChoiceString(choice any) string {
+	s, ok := choice.(string)
+	if ok {
+		return s
+	}
+	choiceMap, ok := choice.(map[string]any)
+	if !ok {
+		return ""
+	}
+	function, ok := choiceMap["function"].(map[string]any)
+	if !ok {
+		return ""
+	}
+	name, _ := function["name"].(string)
+	return name
+}
+
+func chatResponseFromItems(resp fakeModelResponse) *llm.ChatResponse {
+	choice := llm.ChatChoice{FinishReason: "stop"}
+	for _, item := range resp.Output {
+		switch v := item.(type) {
+		case agent.Message:
+			if v.Role == agent.RoleAssistant {
+				choice.Message.Content = v.Content
+			}
+		case agent.Reasoning:
+			choice.Message.ReasoningContent = v.Content
+		case agent.ToolCall:
+			choice.FinishReason = "tool_calls"
+			choice.Message.ToolCalls = append(choice.Message.ToolCalls, llm.ChatToolCall{
+				ID:       v.ID,
+				Type:     "function",
+				Function: llm.ChatFunctionCall{Name: v.Name, Arguments: v.Arguments},
+			})
+		}
+	}
+	return &llm.ChatResponse{
+		ID:      resp.ResponseID,
+		Choices: []llm.ChatChoice{choice},
+		Usage: llm.ChatUsage{
+			PromptTokens:     resp.Usage.InputTokens,
+			CompletionTokens: resp.Usage.OutputTokens,
+			TotalTokens:      resp.Usage.TotalTokens,
+		},
+	}
 }
 
 func TestRunner_Run(t *testing.T) {
 	t.Parallel()
 
 	t.Run("happy path", func(t *testing.T) {
-		model := &fakeModel{responses: []agent.ModelResponse{
+		model := &fakeModel{responses: []fakeModelResponse{
 			{
 				Output: []agent.Item{agent.AssistantMessage("Hello!")},
 				Usage:  agent.Usage{Requests: 1, InputTokens: 10, OutputTokens: 5, TotalTokens: 15},
@@ -74,7 +203,7 @@ func TestRunner_Run(t *testing.T) {
 				return "sunny", nil
 			},
 		}
-		model := &fakeModel{responses: []agent.ModelResponse{
+		model := &fakeModel{responses: []fakeModelResponse{
 			{
 				Output: []agent.Item{agent.ToolCall{ID: "call_1", Name: "get_weather", Arguments: `{"city":"SF"}`}},
 				Usage:  agent.Usage{Requests: 1, InputTokens: 10, OutputTokens: 3, TotalTokens: 13},
@@ -101,12 +230,12 @@ func TestRunner_Run(t *testing.T) {
 	})
 
 	t.Run("handoff", func(t *testing.T) {
-		spanishModel := &fakeModel{responses: []agent.ModelResponse{
+		spanishModel := &fakeModel{responses: []fakeModelResponse{
 			{Output: []agent.Item{agent.AssistantMessage("¡Hola!")}, Usage: agent.Usage{Requests: 1}},
 		}}
 		spanish := &agent.Agent{Name: "Spanish agent", Model: spanishModel, HandoffDescription: "Speaks Spanish."}
 
-		triageModel := &fakeModel{responses: []agent.ModelResponse{
+		triageModel := &fakeModel{responses: []fakeModelResponse{
 			{
 				Output: []agent.Item{agent.ToolCall{ID: "call_1", Name: "transfer_to_Spanish_agent", Arguments: "{}"}},
 				Usage:  agent.Usage{Requests: 1},
@@ -142,13 +271,13 @@ func TestRunner_Run(t *testing.T) {
 	})
 
 	t.Run("multiple handoffs first wins", func(t *testing.T) {
-		first := &agent.Agent{Name: "First", Model: &fakeModel{responses: []agent.ModelResponse{
+		first := &agent.Agent{Name: "First", Model: &fakeModel{responses: []fakeModelResponse{
 			{Output: []agent.Item{agent.AssistantMessage("first here")}},
 		}}}
 		second := &agent.Agent{Name: "Second", Model: &fakeModel{}}
 		triage := &agent.Agent{
 			Name: "Triage",
-			Model: &fakeModel{responses: []agent.ModelResponse{
+			Model: &fakeModel{responses: []fakeModelResponse{
 				{Output: []agent.Item{
 					agent.ToolCall{ID: "call_1", Name: "transfer_to_First", Arguments: "{}"},
 					agent.ToolCall{ID: "call_2", Name: "transfer_to_Second", Arguments: "{}"},
@@ -169,7 +298,7 @@ func TestRunner_Run(t *testing.T) {
 	})
 
 	t.Run("dynamic instructions", func(t *testing.T) {
-		model := &fakeModel{responses: []agent.ModelResponse{
+		model := &fakeModel{responses: []fakeModelResponse{
 			{Output: []agent.Item{agent.AssistantMessage("ok")}},
 		}}
 		ag := &agent.Agent{
@@ -207,7 +336,7 @@ func TestRunner_Run(t *testing.T) {
 				return "again", nil
 			},
 		}
-		model := &fakeModel{responses: []agent.ModelResponse{
+		model := &fakeModel{responses: []fakeModelResponse{
 			{Output: []agent.Item{agent.ToolCall{ID: "call_1", Name: "loop", Arguments: "{}"}}},
 			{Output: []agent.Item{agent.ToolCall{ID: "call_2", Name: "loop", Arguments: "{}"}}},
 		}}
@@ -223,7 +352,7 @@ func TestRunner_Run(t *testing.T) {
 	})
 
 	t.Run("unknown tool", func(t *testing.T) {
-		model := &fakeModel{responses: []agent.ModelResponse{
+		model := &fakeModel{responses: []fakeModelResponse{
 			{Output: []agent.Item{agent.ToolCall{ID: "call_1", Name: "nope", Arguments: "{}"}}},
 		}}
 		ag := &agent.Agent{Name: "assistant", Model: model}
@@ -242,7 +371,7 @@ func TestRunner_Run(t *testing.T) {
 				return "", kaboom
 			},
 		}
-		model := &fakeModel{responses: []agent.ModelResponse{
+		model := &fakeModel{responses: []fakeModelResponse{
 			{Output: []agent.Item{agent.ToolCall{ID: "call_1", Name: "explode", Arguments: "{}"}}},
 		}}
 		ag := &agent.Agent{Name: "assistant", Model: model, Tools: []agent.Tool{tool}}
@@ -260,7 +389,7 @@ func TestRunner_Run(t *testing.T) {
 				return "", errors.New("kaboom")
 			},
 		}
-		model := &fakeModel{responses: []agent.ModelResponse{
+		model := &fakeModel{responses: []fakeModelResponse{
 			{Output: []agent.Item{agent.ToolCall{ID: "call_1", Name: "explode", Arguments: "{}"}}},
 			{Output: []agent.Item{agent.AssistantMessage("recovered")}},
 		}}
@@ -287,7 +416,7 @@ func TestRunner_Run(t *testing.T) {
 				return "custom recovery: " + err.Error()
 			},
 		}
-		model := &fakeModel{responses: []agent.ModelResponse{
+		model := &fakeModel{responses: []fakeModelResponse{
 			{Output: []agent.Item{agent.ToolCall{ID: "call_1", Name: "explode", Arguments: "{}"}}},
 			{Output: []agent.Item{agent.AssistantMessage("ok")}},
 		}}
@@ -312,7 +441,7 @@ func TestRunner_Run(t *testing.T) {
 				return "", ctx.Err()
 			},
 		}
-		model := &fakeModel{responses: []agent.ModelResponse{
+		model := &fakeModel{responses: []fakeModelResponse{
 			{Output: []agent.Item{agent.ToolCall{ID: "call_1", Name: "slow", Arguments: "{}"}}},
 			{Output: []agent.Item{agent.AssistantMessage("moving on")}},
 		}}
@@ -339,7 +468,7 @@ func TestRunner_Run(t *testing.T) {
 				return "", ctx.Err()
 			},
 		}
-		model := &fakeModel{responses: []agent.ModelResponse{
+		model := &fakeModel{responses: []fakeModelResponse{
 			{Output: []agent.Item{agent.ToolCall{ID: "call_1", Name: "slow", Arguments: "{}"}}},
 		}}
 		ag := &agent.Agent{Name: "assistant", Model: model, Tools: []agent.Tool{tool}}
@@ -353,7 +482,7 @@ func TestRunner_Run(t *testing.T) {
 	})
 
 	t.Run("tool choice reset after tool use", func(t *testing.T) {
-		model := &fakeModel{responses: []agent.ModelResponse{
+		model := &fakeModel{responses: []fakeModelResponse{
 			{Output: []agent.Item{agent.ToolCall{ID: "call_1", Name: "loop", Arguments: "{}"}}},
 			{Output: []agent.Item{agent.AssistantMessage("done")}},
 		}}
@@ -372,7 +501,7 @@ func TestRunner_Run(t *testing.T) {
 	})
 
 	t.Run("tool choice reset disabled", func(t *testing.T) {
-		model := &fakeModel{responses: []agent.ModelResponse{
+		model := &fakeModel{responses: []fakeModelResponse{
 			{Output: []agent.Item{agent.ToolCall{ID: "call_1", Name: "loop", Arguments: "{}"}}},
 			{Output: []agent.Item{agent.AssistantMessage("done")}},
 		}}
@@ -391,7 +520,7 @@ func TestRunner_Run(t *testing.T) {
 	})
 
 	t.Run("tool choice none never reset", func(t *testing.T) {
-		model := &fakeModel{responses: []agent.ModelResponse{
+		model := &fakeModel{responses: []fakeModelResponse{
 			{Output: []agent.Item{agent.ToolCall{ID: "call_1", Name: "loop", Arguments: "{}"}}},
 			{Output: []agent.Item{agent.AssistantMessage("done")}},
 		}}
@@ -409,7 +538,7 @@ func TestRunner_Run(t *testing.T) {
 	})
 
 	t.Run("tracer events", func(t *testing.T) {
-		model := &fakeModel{responses: []agent.ModelResponse{
+		model := &fakeModel{responses: []fakeModelResponse{
 			{Output: []agent.Item{agent.ToolCall{ID: "call_1", Name: "loop", Arguments: "{}"}}},
 			{Output: []agent.Item{agent.AssistantMessage("done")}},
 		}}
@@ -433,12 +562,12 @@ func TestRunner_Run(t *testing.T) {
 	})
 
 	t.Run("tracer handoff event", func(t *testing.T) {
-		spanish := &agent.Agent{Name: "Spanish agent", Model: &fakeModel{responses: []agent.ModelResponse{
+		spanish := &agent.Agent{Name: "Spanish agent", Model: &fakeModel{responses: []fakeModelResponse{
 			{Output: []agent.Item{agent.AssistantMessage("¡Hola!")}},
 		}}}
 		triage := &agent.Agent{
 			Name: "Triage",
-			Model: &fakeModel{responses: []agent.ModelResponse{
+			Model: &fakeModel{responses: []fakeModelResponse{
 				{Output: []agent.Item{agent.ToolCall{ID: "call_1", Name: "transfer_to_Spanish_agent", Arguments: "{}"}}},
 			}},
 			Handoffs: []agent.Handoff{agent.HandoffTo(spanish)},
@@ -480,8 +609,26 @@ func TestRunner_Run(t *testing.T) {
 		require.EqualError(t, err, `model response for agent "assistant": fake model has no scripted responses`)
 	})
 
+	t.Run("model response with no choices", func(t *testing.T) {
+		model := &fakeModel{responses: []fakeModelResponse{{Raw: &llm.ChatResponse{}}}}
+		ag := &agent.Agent{Name: "assistant", Model: model}
+
+		_, err := agent.Run(t.Context(), ag, "Hi")
+
+		require.EqualError(t, err, `model response for agent "assistant": chat completions returned no choices`)
+	})
+
+	t.Run("model refusal", func(t *testing.T) {
+		model := &fakeModel{responses: []fakeModelResponse{{Raw: &llm.ChatResponse{Choices: []llm.ChatChoice{{Message: llm.ChatMessage{Refusal: "nope"}}}}}}}
+		ag := &agent.Agent{Name: "assistant", Model: model}
+
+		_, err := agent.Run(t.Context(), ag, "Hi")
+
+		require.EqualError(t, err, `model response for agent "assistant": model behavior error: model refused to produce output: nope`)
+	})
+
 	t.Run("input guardrail tripwire", func(t *testing.T) {
-		model := &fakeModel{responses: []agent.ModelResponse{
+		model := &fakeModel{responses: []fakeModelResponse{
 			{Output: []agent.Item{agent.AssistantMessage("should not matter")}},
 		}}
 		ag := &agent.Agent{
@@ -522,7 +669,7 @@ func TestRunner_Run(t *testing.T) {
 	})
 
 	t.Run("output guardrail tripwire", func(t *testing.T) {
-		model := &fakeModel{responses: []agent.ModelResponse{
+		model := &fakeModel{responses: []fakeModelResponse{
 			{Output: []agent.Item{agent.AssistantMessage("rude words")}},
 		}}
 		ag := &agent.Agent{
@@ -560,12 +707,12 @@ func TestAgent_AsTool(t *testing.T) {
 	t.Parallel()
 
 	t.Run("happy path", func(t *testing.T) {
-		innerModel := &fakeModel{responses: []agent.ModelResponse{
+		innerModel := &fakeModel{responses: []fakeModelResponse{
 			{Output: []agent.Item{agent.AssistantMessage("short summary")}, Usage: agent.Usage{Requests: 1, TotalTokens: 5}},
 		}}
 		inner := &agent.Agent{Name: "Summarizer", Model: innerModel}
 
-		outerModel := &fakeModel{responses: []agent.ModelResponse{
+		outerModel := &fakeModel{responses: []fakeModelResponse{
 			{
 				Output: []agent.Item{agent.ToolCall{ID: "call_1", Name: "Summarizer", Arguments: `{"input":"long text"}`}},
 				Usage:  agent.Usage{Requests: 1, TotalTokens: 10},
@@ -589,7 +736,7 @@ func TestAgent_AsTool(t *testing.T) {
 
 	t.Run("invalid tool input recovered", func(t *testing.T) {
 		inner := &agent.Agent{Name: "Summarizer", Model: &fakeModel{}}
-		outerModel := &fakeModel{responses: []agent.ModelResponse{
+		outerModel := &fakeModel{responses: []fakeModelResponse{
 			{Output: []agent.Item{agent.ToolCall{ID: "call_1", Name: "Summarizer", Arguments: "not json"}}},
 			{Output: []agent.Item{agent.AssistantMessage("could not summarize")}},
 		}}
@@ -655,7 +802,7 @@ func (t *recordingTracer) TurnStarted(_ context.Context, _ *agent.Agent, turn in
 	t.record(fmt.Sprintf("turn_started:%d", turn))
 }
 
-func (t *recordingTracer) ModelCallEnded(_ context.Context, _ *agent.Agent, _ agent.ModelRequest, _ *agent.ModelResponse, _ error) {
+func (t *recordingTracer) ModelCallEnded(_ context.Context, _ *agent.Agent, _ llm.ChatRequest, _ *llm.ChatResponse, _ error) {
 	t.record("model_call_ended")
 }
 
@@ -686,7 +833,7 @@ func TestSlogTracer(t *testing.T) {
 	t.Run("happy path", func(t *testing.T) {
 		var buf bytes.Buffer
 		logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
-		model := &fakeModel{responses: []agent.ModelResponse{
+		model := &fakeModel{responses: []fakeModelResponse{
 			{Output: []agent.Item{agent.ToolCall{ID: "call_1", Name: "loop", Arguments: "{}"}}},
 			{Output: []agent.Item{agent.AssistantMessage("done")}, Usage: agent.Usage{Requests: 1, TotalTokens: 9}},
 		}}

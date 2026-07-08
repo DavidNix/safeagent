@@ -3,6 +3,8 @@ package agent
 import (
 	"context"
 	"log/slog"
+
+	"github.com/DavidNix/safeagent/llm"
 )
 
 // Tracer observes the lifecycle of agent runs. Inject one via Runner.Tracer;
@@ -16,7 +18,7 @@ type Tracer interface {
 	// TurnStarted fires at the beginning of each turn. Turns count from 1.
 	TurnStarted(ctx context.Context, agent *Agent, turn int)
 	// ModelCallEnded fires after every model invocation, successful or not.
-	ModelCallEnded(ctx context.Context, agent *Agent, req ModelRequest, resp *ModelResponse, err error)
+	ModelCallEnded(ctx context.Context, agent *Agent, req llm.ChatRequest, resp *llm.ChatResponse, err error)
 	// ToolStarted fires before a function tool invocation. Handoff calls do
 	// not fire tool events; see Handoff.
 	ToolStarted(ctx context.Context, agent *Agent, call ToolCall)
@@ -40,7 +42,8 @@ func (NoopTracer) RunStarted(context.Context, *Agent, []Item) {}
 func (NoopTracer) TurnStarted(context.Context, *Agent, int) {}
 
 // ModelCallEnded implements Tracer.
-func (NoopTracer) ModelCallEnded(context.Context, *Agent, ModelRequest, *ModelResponse, error) {}
+func (NoopTracer) ModelCallEnded(context.Context, *Agent, llm.ChatRequest, *llm.ChatResponse, error) {
+}
 
 // ToolStarted implements Tracer.
 func (NoopTracer) ToolStarted(context.Context, *Agent, ToolCall) {}
@@ -78,16 +81,16 @@ func (t *SlogTracer) TurnStarted(ctx context.Context, agent *Agent, turn int) {
 }
 
 // ModelCallEnded implements Tracer.
-func (t *SlogTracer) ModelCallEnded(ctx context.Context, agent *Agent, _ ModelRequest, resp *ModelResponse, err error) {
+func (t *SlogTracer) ModelCallEnded(ctx context.Context, agent *Agent, _ llm.ChatRequest, resp *llm.ChatResponse, err error) {
 	if err != nil {
 		t.logger.ErrorContext(ctx, "Model call failed", "agent", agent.Name, "error", err)
 		return
 	}
 	t.logger.DebugContext(ctx, "Model call completed",
 		"agent", agent.Name,
-		"output_items", len(resp.Output),
-		"input_tokens", resp.Usage.InputTokens,
-		"output_tokens", resp.Usage.OutputTokens,
+		"choices", len(resp.Choices),
+		"input_tokens", resp.Usage.PromptTokens,
+		"output_tokens", resp.Usage.CompletionTokens,
 	)
 }
 

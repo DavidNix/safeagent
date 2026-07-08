@@ -4,24 +4,23 @@ A Go port of the core runtime of the [OpenAI Agents SDK](https://github.com/open
 (`@openai/agents-core`): agents with instructions, function tools, handoffs,
 guardrails, and a run loop that drives a model until a final output.
 
-The `agent` package is provider-agnostic. The `agent/llm` subpackage
-implements the `Model` interface against any OpenAI-compatible Chat
-Completions API (OpenAI, OpenRouter, Ollama, vLLM, etc.) over plain HTTP —
-no vendor SDK. It owns its wire types, so provider extensions such as vLLM's
-`reasoning_content` are first-class.
+The `agent` package is provider-agnostic. The top-level `llm` package provides
+plain-HTTP clients for OpenAI-compatible Chat Completions APIs (OpenAI,
+OpenRouter, Ollama, vLLM, etc.). It owns the wire types, so provider
+extensions such as vLLM's `reasoning_content` are first-class.
 
 ## Quick start
 
 ```go
 import (
 	"github.com/DavidNix/safeagent/agent"
-	"github.com/DavidNix/safeagent/agent/llm"
+	"github.com/DavidNix/safeagent/llm"
 )
 
 assistant := &agent.Agent{
 	Name:         "Assistant",
 	Instructions: "You are a helpful assistant.",
-	Model:        llm.NewModel("gpt-4.1"), // reads OPENAI_API_KEY
+	Model:        llm.NewClient("gpt-4.1"), // reads OPENAI_API_KEY
 }
 
 result, err := agent.Run(ctx, assistant, "What is the capital of France?")
@@ -260,7 +259,7 @@ no HTTP, no API key:
 
 ```go
 type Model interface {
-	GetResponse(ctx context.Context, req ModelRequest) (*ModelResponse, error)
+	Complete(ctx context.Context, req llm.ChatRequest) (*llm.ChatResponse, error)
 }
 ```
 
@@ -269,27 +268,18 @@ the requests it received (see `run_test.go` for a reference implementation).
 Any backend — a different vendor API, a local model, a rules engine — plugs
 in the same way.
 
-The `llm` package options: `llm.WithBaseURL` (point it at any
-OpenAI-compatible server), `llm.WithAPIKey`, `llm.WithMaxRetries` and
-`llm.WithRetryDelay` (retryable failures — HTTP 429, 5xx, and transport
-errors — are retried with exponential backoff, honoring `Retry-After`; the
-default is 2 retries), and `llm.WithClient`, which accepts any `llm.Doer`:
-
-```go
-type Doer interface {
-	Do(req *http.Request) (*http.Response, error)
-}
-```
-
-`*http.Client` satisfies it directly; wrap one for logging, custom auth, or
-other middleware, or inject a fake in tests to skip HTTP entirely.
+The `llm` package options include `llm.WithBaseURL` (point it at any
+OpenAI-compatible server), `llm.WithAPIKey`, `llm.WithHTTPClient`, static
+headers/query params, and constructor-level JSON extra fields for provider
+extensions. `llm.Client` defaults to zero retries; configure
+`llm.WithMaxRetries` explicitly or wrap clients in `llm.CircuitBreaker` for
+immediate failover on HTTP 429, 5xx, and transport failures.
 
 Reasoning models served with a reasoning parser (for example
 `vllm serve ... --reasoning-parser deepseek_r1`) return their thinking in a
-`reasoning_content` field; the `llm` package surfaces it as an
-`agent.Reasoning` item in `ModelResponse.Output` — visible to tracers via
-`ModelCallEnded` — and never replays reasoning items back to the model when
-converting history into requests.
+`reasoning_content` field. The runner converts it into an `agent.Reasoning`
+item and never replays reasoning items back to the model when converting
+history into requests.
 
 ## Not ported (yet)
 
