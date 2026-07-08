@@ -10,8 +10,7 @@ fmt: ## Run formatters
 	go tool modernize -fix ./...
 
 .PHONY: vet
-vet: fmt ## Run Go LSP diagnostics and linters
-	gopls check $$(git ls-files '*.go')
+vet: fmt ## Run formatters and linters
 	golangci-lint run ./...
 
 .PHONY: test
