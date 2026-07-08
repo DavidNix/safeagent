@@ -45,6 +45,17 @@ func TestClient_Complete(t *testing.T) {
 		runLLME2ECompletion(t, ctx, client, "SAFEAGENT_LLM_VLLM_E2E")
 	})
 
+	t.Run("e2e vllm reasoning", func(t *testing.T) {
+		skipE2EInShortMode(t)
+		baseURL := requireE2EEnv(t, vllmBaseURLEnv)
+		ctx, cancel := e2eContext(t)
+		defer cancel()
+
+		client := newVLLMReasoningE2EClient(t, ctx, baseURL)
+
+		runLLMReasoningE2ECompletion(t, ctx, client, "SAFEAGENT_LLM_VLLM_REASONING_E2E")
+	})
+
 	t.Run("happy path sends chat completion request and decodes api response", func(t *testing.T) {
 		request := &capturedRequest{}
 		server := chatCompletionServer(t, http.StatusOK, "It is sunny.", request, nil)
@@ -98,6 +109,23 @@ func TestClient_Complete(t *testing.T) {
 		require.Equal(t, "It is sunny.", resp.Choices[0].Message.Content)
 		require.Equal(t, []llm.ChatToolCall{{ID: "call_2", Type: "function", Function: llm.ChatFunctionCall{Name: "get_weather", Arguments: "{}"}}}, resp.Choices[0].Message.ToolCalls)
 		require.Equal(t, llm.ChatUsage{PromptTokens: 10, CompletionTokens: 5, TotalTokens: 15}, resp.Usage)
+	})
+
+	t.Run("decodes vllm reasoning field", func(t *testing.T) {
+		server := rawJSONServer(t, http.StatusOK, `{
+			"id":"chatcmpl-test",
+			"choices":[{"message":{"role":"assistant","content":"final","reasoning":"hidden chain"},"finish_reason":"stop"}],
+			"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}
+		}`)
+		t.Cleanup(server.Close)
+
+		client := llm.NewClient("gpt-test", llm.WithBaseURL(server.URL), llm.WithAPIKey("test-key"))
+
+		resp, err := client.Complete(t.Context(), llm.ChatRequest{Messages: []llm.ChatMessage{{Role: "user", Content: "hello"}}})
+
+		require.NoError(t, err)
+		require.Equal(t, "hidden chain", resp.Choices[0].Message.ReasoningContent)
+		require.Equal(t, "final", resp.Choices[0].Message.Content)
 	})
 
 	t.Run("provider constructors apply openrouter and vllm configuration", func(t *testing.T) {
@@ -371,6 +399,21 @@ func modelsServer(t *testing.T, status int, body string, captured *capturedReque
 			captured.Header = r.Header.Clone()
 			captured.Body = bodyBytes
 		}
+		if status >= http.StatusBadRequest {
+			w.WriteHeader(status)
+			_, _ = w.Write([]byte(body))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(body))
+	}))
+}
+
+func rawJSONServer(t *testing.T, status int, body string) *httptest.Server {
+	t.Helper()
+
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		captureJSONRequest(t, r, nil)
 		if status >= http.StatusBadRequest {
 			w.WriteHeader(status)
 			_, _ = w.Write([]byte(body))

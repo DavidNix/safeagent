@@ -261,6 +261,22 @@ type ChatMessage struct {
 	ToolCallID       string         `json:"tool_call_id,omitempty"`
 }
 
+func (m *ChatMessage) UnmarshalJSON(data []byte) error {
+	type chatMessage ChatMessage
+	var raw struct {
+		chatMessage
+		Reasoning string `json:"reasoning,omitempty"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	*m = ChatMessage(raw.chatMessage)
+	if m.ReasoningContent == "" {
+		m.ReasoningContent = raw.Reasoning
+	}
+	return nil
+}
+
 // ChatFunctionDefinition describes a function tool.
 type ChatFunctionDefinition struct {
 	Name        string          `json:"name"`
