@@ -44,6 +44,15 @@ type ToolOutput struct {
 
 func (ToolOutput) isItem() {}
 
+// Reasoning is a model reasoning trace, emitted by providers that expose one
+// (for example vLLM with a reasoning parser). It is output-only: providers
+// never send it back to the model when converting history into a request.
+type Reasoning struct {
+	Content string
+}
+
+func (Reasoning) isItem() {}
+
 // UserMessage builds a user role message item.
 func UserMessage(content string) Message {
 	return Message{Role: RoleUser, Content: content}

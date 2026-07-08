@@ -6,26 +6,22 @@ guardrails, and a run loop that drives a model until a final output.
 
 The `agent` package is provider-agnostic. The `agent/llm` subpackage
 implements the `Model` interface against any OpenAI-compatible Chat
-Completions API (OpenAI, OpenRouter, Ollama, vLLM, etc.). You construct and
-configure the client — typically the official
-[openai-go](https://github.com/openai/openai-go) SDK — and inject it via the
-`llm.Client` interface.
+Completions API (OpenAI, OpenRouter, Ollama, vLLM, etc.) over plain HTTP —
+no vendor SDK. It owns its wire types, so provider extensions such as vLLM's
+`reasoning_content` are first-class.
 
 ## Quick start
 
 ```go
 import (
-	"github.com/openai/openai-go/v3"
-
 	"github.com/DavidNix/safeagent/agent"
 	"github.com/DavidNix/safeagent/agent/llm"
 )
 
-client := openai.NewClient() // reads OPENAI_API_KEY
 assistant := &agent.Agent{
 	Name:         "Assistant",
 	Instructions: "You are a helpful assistant.",
-	Model:        llm.NewModel("gpt-4.1", &client.Chat.Completions),
+	Model:        llm.NewModel("gpt-4.1"), // reads OPENAI_API_KEY
 }
 
 result, err := agent.Run(ctx, assistant, "What is the capital of France?")
@@ -273,11 +269,27 @@ the requests it received (see `run_test.go` for a reference implementation).
 Any backend — a different vendor API, a local model, a rules engine — plugs
 in the same way.
 
-The `llm` package accepts any implementation of its one-method `llm.Client`
-interface. `&client.Chat.Completions` from an `openai.Client` satisfies it,
-configured however you need (`option.WithBaseURL` for compatible servers,
-`option.WithAPIKey`, `option.WithHTTPClient`, retries, middleware) — or
-substitute your own fake in tests without any HTTP server at all.
+The `llm` package options: `llm.WithBaseURL` (point it at any
+OpenAI-compatible server), `llm.WithAPIKey`, `llm.WithMaxRetries` and
+`llm.WithRetryDelay` (retryable failures — HTTP 429, 5xx, and transport
+errors — are retried with exponential backoff, honoring `Retry-After`; the
+default is 2 retries), and `llm.WithClient`, which accepts any `llm.Doer`:
+
+```go
+type Doer interface {
+	Do(req *http.Request) (*http.Response, error)
+}
+```
+
+`*http.Client` satisfies it directly; wrap one for logging, custom auth, or
+other middleware, or inject a fake in tests to skip HTTP entirely.
+
+Reasoning models served with a reasoning parser (for example
+`vllm serve ... --reasoning-parser deepseek_r1`) return their thinking in a
+`reasoning_content` field; the `llm` package surfaces it as an
+`agent.Reasoning` item in `ModelResponse.Output` — visible to tracers via
+`ModelCallEnded` — and never replays reasoning items back to the model when
+converting history into requests.
 
 ## Not ported (yet)
 

@@ -5,24 +5,15 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
+	"time"
 
-	"github.com/openai/openai-go/v3"
-	"github.com/openai/openai-go/v3/option"
 	"github.com/stretchr/testify/require"
 
 	"github.com/DavidNix/safeagent/agent"
 	"github.com/DavidNix/safeagent/agent/llm"
 )
-
-func newTestClient(baseURL string, extra ...option.RequestOption) llm.Client {
-	opts := append([]option.RequestOption{
-		option.WithBaseURL(baseURL),
-		option.WithAPIKey("test-key"),
-	}, extra...)
-	client := openai.NewClient(opts...)
-	return &client.Chat.Completions
-}
 
 func TestModel_GetResponse(t *testing.T) {
 	t.Parallel()
@@ -54,7 +45,7 @@ func TestModel_GetResponse(t *testing.T) {
 		}))
 		defer srv.Close()
 
-		model := llm.NewModel("gpt-test", newTestClient(srv.URL))
+		model := llm.NewModel("gpt-test", llm.WithBaseURL(srv.URL), llm.WithAPIKey("test-key"))
 		resp, err := model.GetResponse(t.Context(), agent.ModelRequest{
 			SystemInstructions: "Be helpful",
 			Input: []agent.Item{
@@ -116,12 +107,11 @@ func TestModel_GetResponse(t *testing.T) {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			body, _ := io.ReadAll(r.Body)
 			gotBody = body
-			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"id":"x","choices":[{"message":{"content":"ok"}}],"usage":{}}`))
 		}))
 		defer srv.Close()
 
-		model := llm.NewModel("gpt-test", newTestClient(srv.URL))
+		model := llm.NewModel("gpt-test", llm.WithBaseURL(srv.URL), llm.WithAPIKey("test-key"))
 		_, err := model.GetResponse(t.Context(), agent.ModelRequest{
 			Input:         []agent.Item{agent.UserMessage("hi")},
 			ModelSettings: agent.ModelSettings{ToolChoice: "get_weather"},
@@ -135,28 +125,118 @@ func TestModel_GetResponse(t *testing.T) {
 		}`, string(gotBody))
 	})
 
-	t.Run("status error", func(t *testing.T) {
+	t.Run("reasoning content extracted", func(t *testing.T) {
+		var gotBody []byte
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			body, _ := io.ReadAll(r.Body)
+			gotBody = body
+			_, _ = w.Write([]byte(`{
+				"id": "x",
+				"choices": [{"message": {
+					"reasoning_content": "The user greeted me, I should greet back.",
+					"content": "Hello!"
+				}}],
+				"usage": {}
+			}`))
+		}))
+		defer srv.Close()
+
+		model := llm.NewModel("r1-test", llm.WithBaseURL(srv.URL), llm.WithAPIKey("test-key"))
+		resp, err := model.GetResponse(t.Context(), agent.ModelRequest{
+			Input: []agent.Item{
+				agent.UserMessage("hi"),
+				agent.Reasoning{Content: "prior turn thinking"},
+				agent.AssistantMessage("earlier reply"),
+			},
+		})
+
+		require.NoError(t, err)
+		require.Equal(t, []agent.Item{
+			agent.Reasoning{Content: "The user greeted me, I should greet back."},
+			agent.AssistantMessage("Hello!"),
+		}, resp.Output)
+		require.JSONEq(t, `{
+			"model": "r1-test",
+			"messages": [
+				{"role":"user","content":"hi"},
+				{"role":"assistant","content":"earlier reply"}
+			]
+		}`, string(gotBody))
+	})
+
+	t.Run("retries then succeeds", func(t *testing.T) {
+		var attempts atomic.Int32
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			if attempts.Add(1) <= 2 {
+				w.WriteHeader(http.StatusInternalServerError)
+				_, _ = w.Write([]byte("boom"))
+				return
+			}
+			_, _ = w.Write([]byte(`{"id":"x","choices":[{"message":{"content":"ok"}}],"usage":{}}`))
+		}))
+		defer srv.Close()
+
+		model := llm.NewModel("gpt-test",
+			llm.WithBaseURL(srv.URL),
+			llm.WithAPIKey("test-key"),
+			llm.WithMaxRetries(2),
+			llm.WithRetryDelay(time.Millisecond),
+		)
+		resp, err := model.GetResponse(t.Context(), agent.ModelRequest{Input: []agent.Item{agent.UserMessage("hi")}})
+
+		require.NoError(t, err)
+		require.Equal(t, []agent.Item{agent.AssistantMessage("ok")}, resp.Output)
+		require.Equal(t, int32(3), attempts.Load())
+	})
+
+	t.Run("retries exhausted", func(t *testing.T) {
+		var attempts atomic.Int32
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			attempts.Add(1)
 			w.WriteHeader(http.StatusInternalServerError)
 			_, _ = w.Write([]byte("boom"))
 		}))
 		defer srv.Close()
 
-		model := llm.NewModel("gpt-test", newTestClient(srv.URL, option.WithMaxRetries(0)))
+		model := llm.NewModel("gpt-test",
+			llm.WithBaseURL(srv.URL),
+			llm.WithAPIKey("test-key"),
+			llm.WithMaxRetries(1),
+			llm.WithRetryDelay(time.Millisecond),
+		)
 		_, err := model.GetResponse(t.Context(), agent.ModelRequest{Input: []agent.Item{agent.UserMessage("hi")}})
 
-		require.ErrorContains(t, err, "chat completion: ")
-		require.ErrorContains(t, err, "500")
+		require.EqualError(t, err, "chat completions failed after 2 attempts: chat completions returned status 500: boom")
+		require.Equal(t, int32(2), attempts.Load())
+	})
+
+	t.Run("client error not retried", func(t *testing.T) {
+		var attempts atomic.Int32
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			attempts.Add(1)
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte("bad request"))
+		}))
+		defer srv.Close()
+
+		model := llm.NewModel("gpt-test",
+			llm.WithBaseURL(srv.URL),
+			llm.WithAPIKey("test-key"),
+			llm.WithRetryDelay(time.Millisecond),
+		)
+		_, err := model.GetResponse(t.Context(), agent.ModelRequest{Input: []agent.Item{agent.UserMessage("hi")}})
+
+		require.EqualError(t, err, "chat completions returned status 400: bad request")
+		require.Equal(t, int32(1), attempts.Load())
 	})
 
 	t.Run("no choices", func(t *testing.T) {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"id":"x","choices":[],"usage":{}}`))
 		}))
 		defer srv.Close()
 
-		model := llm.NewModel("gpt-test", newTestClient(srv.URL))
+		model := llm.NewModel("gpt-test", llm.WithBaseURL(srv.URL), llm.WithAPIKey("test-key"))
 		_, err := model.GetResponse(t.Context(), agent.ModelRequest{Input: []agent.Item{agent.UserMessage("hi")}})
 
 		require.EqualError(t, err, "chat completions returned no choices")
@@ -164,12 +244,11 @@ func TestModel_GetResponse(t *testing.T) {
 
 	t.Run("refusal", func(t *testing.T) {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"id":"x","choices":[{"message":{"refusal":"nope"}}],"usage":{}}`))
 		}))
 		defer srv.Close()
 
-		model := llm.NewModel("gpt-test", newTestClient(srv.URL))
+		model := llm.NewModel("gpt-test", llm.WithBaseURL(srv.URL), llm.WithAPIKey("test-key"))
 		_, err := model.GetResponse(t.Context(), agent.ModelRequest{Input: []agent.Item{agent.UserMessage("hi")}})
 
 		require.EqualError(t, err, "model behavior error: model refused to produce output: nope")
