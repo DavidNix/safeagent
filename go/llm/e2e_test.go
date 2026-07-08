@@ -50,6 +50,25 @@ func newOpenRouterE2EClient(apiKey, baseURL string) *llm.Client {
 		ChatModel: openRouterE2EModel,
 		SiteURL:   "https://github.com/DavidNix/safeagent",
 		AppTitle:  "SafeAgent E2E",
+		ExtraFields: map[string]any{
+			"reasoning.effort": "none",
+		},
+	}
+	if baseURL != "" {
+		cfg.BaseURL = baseURL
+	}
+	return llm.NewOpenRouter(cfg)
+}
+
+func newOpenRouterReasoningE2EClient(apiKey, baseURL string) *llm.Client {
+	cfg := llm.OpenRouterConfig{
+		APIKey:    apiKey,
+		ChatModel: openRouterE2EModel,
+		SiteURL:   "https://github.com/DavidNix/safeagent",
+		AppTitle:  "SafeAgent E2E",
+		ExtraFields: map[string]any{
+			"reasoning.max_tokens": e2eReasoningTokenBudget,
+		},
 	}
 	if baseURL != "" {
 		cfg.BaseURL = baseURL

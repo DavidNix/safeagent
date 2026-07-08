@@ -34,6 +34,17 @@ func TestClient_Complete(t *testing.T) {
 		runLLME2ECompletion(t, ctx, client, "SAFEAGENT_LLM_OPENROUTER_E2E")
 	})
 
+	t.Run("e2e openrouter reasoning", func(t *testing.T) {
+		skipE2EInShortMode(t)
+		apiKey := requireE2EEnv(t, openRouterAPIKeyEnv)
+		ctx, cancel := e2eContext(t)
+		defer cancel()
+
+		client := newOpenRouterReasoningE2EClient(apiKey, "")
+
+		runLLMReasoningE2ECompletion(t, ctx, client, "SAFEAGENT_LLM_OPENROUTER_REASONING_E2E")
+	})
+
 	t.Run("e2e vllm client", func(t *testing.T) {
 		skipE2EInShortMode(t)
 		baseURL := requireE2EEnv(t, vllmBaseURLEnv)
