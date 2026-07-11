@@ -433,6 +433,33 @@ func TestRunner_Run(t *testing.T) {
 		}))
 	})
 
+	t.Run("tool local deadline error is recovered", func(t *testing.T) {
+		tool := agent.Tool{
+			Name: "deadline",
+			OnInvoke: func(_ context.Context, _ *agent.RunContext, _ string) (string, error) {
+				return "", context.DeadlineExceeded
+			},
+			OnInvokeError: func(_ context.Context, _ *agent.RunContext, err error) string {
+				return "recovered: " + err.Error()
+			},
+		}
+		model := &fakeModel{responses: []fakeModelResponse{
+			{Output: []agent.Item{agent.ToolCall{ID: "call_1", Name: "deadline", Arguments: "{}"}}},
+			{Output: []agent.Item{agent.AssistantMessage("done")}},
+		}}
+		ag := &agent.Agent{Name: "assistant", Model: model, Tools: []agent.Tool{tool}}
+
+		result, err := agent.Run(t.Context(), ag, "Hi")
+
+		require.NoError(t, err)
+		require.Equal(t, "done", result.FinalOutput)
+		require.Contains(t, model.requests[1].Input, agent.Item(agent.ToolOutput{
+			CallID: "call_1",
+			Name:   "deadline",
+			Output: "recovered: context deadline exceeded",
+		}))
+	})
+
 	t.Run("tool timeout recovered by default", func(t *testing.T) {
 		tool := agent.Tool{
 			Name:    "slow",
@@ -628,6 +655,29 @@ func TestRunner_Run(t *testing.T) {
 		require.EqualError(t, err, `model response for agent "assistant": model behavior error: model refused to produce output: nope`)
 	})
 
+	t.Run("model response truncated by length", func(t *testing.T) {
+		model := &fakeModel{responses: []fakeModelResponse{{Raw: &llm.ChatResponse{Choices: []llm.ChatChoice{{
+			Message:      llm.ChatMessage{Content: "partial"},
+			FinishReason: "length",
+		}}}}}}
+		ag := &agent.Agent{Name: "assistant", Model: model}
+
+		_, err := agent.Run(t.Context(), ag, "Hi")
+
+		require.EqualError(t, err, `model response for agent "assistant": model behavior error: model stopped with finish reason "length"`)
+	})
+
+	t.Run("model response has tool finish reason without calls", func(t *testing.T) {
+		model := &fakeModel{responses: []fakeModelResponse{{Raw: &llm.ChatResponse{Choices: []llm.ChatChoice{{
+			FinishReason: "tool_calls",
+		}}}}}}
+		ag := &agent.Agent{Name: "assistant", Model: model}
+
+		_, err := agent.Run(t.Context(), ag, "Hi")
+
+		require.EqualError(t, err, `model response for agent "assistant": model behavior error: model stopped for tool calls without returning any`)
+	})
+
 	t.Run("input guardrail tripwire", func(t *testing.T) {
 		model := &fakeModel{responses: []fakeModelResponse{
 			{Output: []agent.Item{agent.AssistantMessage("should not matter")}},
@@ -687,6 +737,85 @@ func TestRunner_Run(t *testing.T) {
 		_, err := agent.Run(t.Context(), ag, "Hi")
 
 		require.EqualError(t, err, `output guardrail "profanity" tripwire triggered`)
+	})
+
+	t.Run("output guardrail usage is included", func(t *testing.T) {
+		model := &fakeModel{responses: []fakeModelResponse{{
+			Output: []agent.Item{agent.AssistantMessage("done")},
+			Usage:  agent.Usage{Requests: 1, TotalTokens: 5},
+		}}}
+		ag := &agent.Agent{
+			Name:  "assistant",
+			Model: model,
+			OutputGuardrails: []agent.OutputGuardrail{{
+				Name: "model-backed",
+				Execute: func(_ context.Context, rc *agent.RunContext, _ *agent.Agent, _ string) (agent.GuardrailOutput, error) {
+					rc.AddUsage(agent.Usage{Requests: 1, TotalTokens: 7})
+					return agent.GuardrailOutput{}, nil
+				},
+			}},
+		}
+
+		result, err := agent.Run(t.Context(), ag, "Hi")
+
+		require.NoError(t, err)
+		require.Equal(t, agent.Usage{Requests: 2, TotalTokens: 12}, result.Usage)
+	})
+
+	t.Run("invalid agent configuration", func(t *testing.T) {
+		model := &fakeModel{responses: []fakeModelResponse{{Output: []agent.Item{agent.AssistantMessage("unused")}}}}
+		tests := []struct {
+			name string
+			ag   *agent.Agent
+			err  string
+		}{
+			{name: "nil tool callback", ag: &agent.Agent{Name: "assistant", Model: model, Tools: []agent.Tool{{Name: "broken"}}}, err: `agent "assistant" tool "broken" has no OnInvoke callback`},
+			{name: "nil input guardrail callback", ag: &agent.Agent{Name: "assistant", Model: model, InputGuardrails: []agent.InputGuardrail{{Name: "broken"}}}, err: `agent "assistant" input guardrail "broken" has no Execute callback`},
+			{name: "nil output guardrail callback", ag: &agent.Agent{Name: "assistant", Model: model, OutputGuardrails: []agent.OutputGuardrail{{Name: "broken"}}}, err: `agent "assistant" output guardrail "broken" has no Execute callback`},
+			{name: "nil handoff agent", ag: &agent.Agent{Name: "assistant", Model: model, Handoffs: []agent.Handoff{{ToolName: "transfer"}}}, err: `agent "assistant" handoff "transfer" has no target agent`},
+			{name: "duplicate tool names", ag: &agent.Agent{Name: "assistant", Model: model, Tools: []agent.Tool{loopTool(), loopTool()}}, err: `agent "assistant" has duplicate function name "loop"`},
+			{name: "duplicate handoff names", ag: &agent.Agent{Name: "assistant", Model: model, Handoffs: []agent.Handoff{{Agent: &agent.Agent{Name: "first"}, ToolName: "transfer"}, {Agent: &agent.Agent{Name: "second"}, ToolName: "transfer"}}}, err: `agent "assistant" has duplicate function name "transfer"`},
+			{name: "generated handoff collision", ag: &agent.Agent{Name: "assistant", Model: model, Handoffs: []agent.Handoff{agent.HandoffTo(&agent.Agent{Name: "Sales US"}), agent.HandoffTo(&agent.Agent{Name: "Sales@US"})}}, err: `agent "assistant" has duplicate function name "transfer_to_Sales_US"`},
+			{name: "tool and handoff collision", ag: &agent.Agent{Name: "assistant", Model: model, Tools: []agent.Tool{loopTool()}, Handoffs: []agent.Handoff{{Agent: &agent.Agent{Name: "target"}, ToolName: "loop"}}}, err: `agent "assistant" has duplicate function name "loop"`},
+		}
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				_, err := agent.Run(t.Context(), tt.ag, "Hi")
+				require.EqualError(t, err, tt.err)
+				var userErr *agent.UserError
+				require.ErrorAs(t, err, &userErr)
+			})
+		}
+	})
+
+	t.Run("mixed tool and handoff calls are rejected before execution", func(t *testing.T) {
+		var toolCalled bool
+		var handoffCalled bool
+		target := &agent.Agent{Name: "target", Model: &fakeModel{}}
+		handoff := agent.HandoffTo(target)
+		handoff.OnHandoff = func(_ context.Context, _ *agent.RunContext, _ string) error {
+			handoffCalled = true
+			return nil
+		}
+		model := &fakeModel{responses: []fakeModelResponse{{Output: []agent.Item{
+			agent.ToolCall{ID: "call_1", Name: "loop", Arguments: "{}"},
+			agent.ToolCall{ID: "call_2", Name: "transfer_to_target", Arguments: "{}"},
+		}}}}
+		ag := &agent.Agent{
+			Name:  "assistant",
+			Model: model,
+			Tools: []agent.Tool{{Name: "loop", OnInvoke: func(_ context.Context, _ *agent.RunContext, _ string) (string, error) {
+				toolCalled = true
+				return "ok", nil
+			}}},
+			Handoffs: []agent.Handoff{handoff},
+		}
+
+		_, err := agent.Run(t.Context(), ag, "Hi")
+
+		require.EqualError(t, err, `model behavior error: response mixed tool calls with a handoff`)
+		require.False(t, toolCalled)
+		require.False(t, handoffCalled)
 	})
 
 	t.Run("nil agent", func(t *testing.T) {

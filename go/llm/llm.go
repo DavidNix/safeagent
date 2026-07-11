@@ -14,6 +14,7 @@ import (
 	"math/rand/v2"
 	"net"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -261,6 +262,28 @@ type ChatMessage struct {
 	ToolCallID       string         `json:"tool_call_id,omitempty"`
 }
 
+func (m ChatMessage) MarshalJSON() ([]byte, error) {
+	var content *string
+	if m.Role != "assistant" || len(m.ToolCalls) == 0 || m.Content != "" {
+		content = &m.Content
+	}
+	return json.Marshal(struct {
+		Role             string         `json:"role"`
+		Content          *string        `json:"content,omitempty"`
+		ReasoningContent string         `json:"reasoning_content,omitempty"`
+		Refusal          string         `json:"refusal,omitempty"`
+		ToolCalls        []ChatToolCall `json:"tool_calls,omitempty"`
+		ToolCallID       string         `json:"tool_call_id,omitempty"`
+	}{
+		Role:             m.Role,
+		Content:          content,
+		ReasoningContent: m.ReasoningContent,
+		Refusal:          m.Refusal,
+		ToolCalls:        m.ToolCalls,
+		ToolCallID:       m.ToolCallID,
+	})
+}
+
 func (m *ChatMessage) UnmarshalJSON(data []byte) error {
 	type chatMessage ChatMessage
 	var raw struct {
@@ -477,15 +500,19 @@ func (c *Client) roundTrip(ctx context.Context, body []byte) (*ChatResponse, err
 	defer func() { _ = resp.Body.Close() }()
 
 	respBody, err := readResponseBody(resp.Body, c.maxRespBody)
-	if err != nil {
-		return nil, fmt.Errorf("read chat completions response: %w", err)
-	}
 	if resp.StatusCode != http.StatusOK {
+		var tooLarge *ResponseTooLargeError
+		if err != nil && !errors.As(err, &tooLarge) {
+			return nil, fmt.Errorf("read chat completions response: %w", err)
+		}
 		return nil, &StatusError{
 			StatusCode: resp.StatusCode,
 			Body:       string(respBody),
 			RetryAfter: resp.Header.Get("Retry-After"),
 		}
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read chat completions response: %w", err)
 	}
 
 	var parsed ChatResponse
@@ -534,7 +561,7 @@ func readResponseBody(r io.Reader, limit int64) ([]byte, error) {
 		return nil, err
 	}
 	if int64(len(body)) > limit {
-		return nil, &ResponseTooLargeError{Limit: limit}
+		return body[:limit], &ResponseTooLargeError{Limit: limit}
 	}
 	return body, nil
 }
@@ -585,7 +612,20 @@ func newDefaultHTTPClient() *http.Client {
 }
 
 func applyExtraFields(payload map[string]any, extraFields map[string]any) {
-	for key, value := range extraFields {
+	keys := make([]string, 0, len(extraFields))
+	for key := range extraFields {
+		keys = append(keys, key)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		leftDepth := strings.Count(keys[i], ".")
+		rightDepth := strings.Count(keys[j], ".")
+		if leftDepth != rightDepth {
+			return leftDepth < rightDepth
+		}
+		return keys[i] < keys[j]
+	})
+	for _, key := range keys {
+		value := extraFields[key]
 		setJSONPath(payload, strings.Split(key, "."), value)
 	}
 }

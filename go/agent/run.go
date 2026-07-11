@@ -43,6 +43,9 @@ func (r *Runner) RunItems(ctx context.Context, agent *Agent, input []Item) (*Run
 	if agent == nil {
 		return nil, &UserError{Message: "agent is nil"}
 	}
+	if err := agent.validate(); err != nil {
+		return nil, err
+	}
 	tracer := r.Tracer
 	if tracer == nil {
 		tracer = NoopTracer{}
@@ -73,8 +76,8 @@ func (r *Runner) runItems(ctx context.Context, tracer Tracer, agent *Agent, inpu
 
 	for turn := 1; turn <= maxTurns; turn++ {
 		tracer.TurnStarted(ctx, current, turn)
-		if current.Model == nil {
-			return nil, &UserError{Message: fmt.Sprintf("agent %q has no model", current.Name)}
+		if err := current.validate(); err != nil {
+			return nil, err
 		}
 		instructions, err := current.resolveInstructions(ctx, rc)
 		if err != nil {
@@ -119,12 +122,12 @@ func (r *Runner) runItems(ctx context.Context, tracer Tracer, agent *Agent, inpu
 
 		result.FinalOutput = lastAssistantText(output)
 		result.History = history
-		result.Usage = rc.Usage()
 		outputResults, err := runOutputGuardrails(ctx, rc, current, result.FinalOutput)
 		result.OutputGuardrailResults = outputResults
 		if err != nil {
 			return nil, err
 		}
+		result.Usage = rc.Usage()
 		return result, nil
 	}
 	return nil, &MaxTurnsExceededError{MaxTurns: maxTurns}
@@ -237,6 +240,12 @@ func parseChatResponse(resp *llm.ChatResponse) ([]Item, Usage, error) {
 	if choice.Message.Refusal != "" {
 		return nil, usage, &ModelBehaviorError{Message: "model refused to produce output: " + choice.Message.Refusal}
 	}
+	if choice.FinishReason != "" && choice.FinishReason != "stop" && choice.FinishReason != "tool_calls" {
+		return nil, usage, &ModelBehaviorError{Message: fmt.Sprintf("model stopped with finish reason %q", choice.FinishReason)}
+	}
+	if choice.FinishReason == "tool_calls" && len(choice.Message.ToolCalls) == 0 {
+		return nil, usage, &ModelBehaviorError{Message: "model stopped for tool calls without returning any"}
+	}
 
 	var output []Item
 	if choice.Message.ReasoningContent != "" {
@@ -269,6 +278,7 @@ func processTurn(ctx context.Context, rc *RunContext, tracer Tracer, agent *Agen
 	var handoff *Handoff
 	var handoffCall ToolCall
 	var rejectedHandoffs []Item
+	var hasToolCall bool
 
 	for _, item := range output {
 		call, ok := item.(ToolCall)
@@ -294,7 +304,11 @@ func processTurn(ctx context.Context, rc *RunContext, tracer Tracer, agent *Agen
 				Message: fmt.Sprintf("tool %q not found on agent %q", call.Name, agent.Name),
 			}
 		}
+		hasToolCall = true
 		pending = append(pending, pendingToolCall{call: call, tool: tool})
+	}
+	if handoff != nil && hasToolCall {
+		return nil, nil, &ModelBehaviorError{Message: "response mixed tool calls with a handoff"}
 	}
 
 	toolOutputs := make([]Item, len(pending))
@@ -386,7 +400,7 @@ func recoverToolError(ctx context.Context, rc *RunContext, tool Tool, call ToolC
 			return tool.OnTimeout(ctx, rc, timeoutErr), nil
 		}
 		return timeoutErr.Error(), nil
-	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+	case ctx.Err() != nil && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)):
 		return "", fmt.Errorf("tool %q: %w", call.Name, err)
 	case tool.PropagateErrors:
 		return "", &ToolCallError{ToolName: call.Name, Err: err}

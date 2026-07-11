@@ -111,3 +111,41 @@ func (a *Agent) handoffDefinitions() []HandoffDefinition {
 	}
 	return defs
 }
+
+func (a *Agent) validate() error {
+	if a.Model == nil {
+		return &UserError{Message: fmt.Sprintf("agent %q has no model", a.Name)}
+	}
+
+	functionNames := make(map[string]struct{}, len(a.Tools)+len(a.Handoffs))
+	for _, tool := range a.Tools {
+		if tool.OnInvoke == nil {
+			return &UserError{Message: fmt.Sprintf("agent %q tool %q has no OnInvoke callback", a.Name, tool.Name)}
+		}
+		if _, exists := functionNames[tool.Name]; exists {
+			return &UserError{Message: fmt.Sprintf("agent %q has duplicate function name %q", a.Name, tool.Name)}
+		}
+		functionNames[tool.Name] = struct{}{}
+	}
+	for _, handoff := range a.Handoffs {
+		if handoff.Agent == nil {
+			return &UserError{Message: fmt.Sprintf("agent %q handoff %q has no target agent", a.Name, handoff.ToolName)}
+		}
+		name := handoff.toolName()
+		if _, exists := functionNames[name]; exists {
+			return &UserError{Message: fmt.Sprintf("agent %q has duplicate function name %q", a.Name, name)}
+		}
+		functionNames[name] = struct{}{}
+	}
+	for _, guardrail := range a.InputGuardrails {
+		if guardrail.Execute == nil {
+			return &UserError{Message: fmt.Sprintf("agent %q input guardrail %q has no Execute callback", a.Name, guardrail.Name)}
+		}
+	}
+	for _, guardrail := range a.OutputGuardrails {
+		if guardrail.Execute == nil {
+			return &UserError{Message: fmt.Sprintf("agent %q output guardrail %q has no Execute callback", a.Name, guardrail.Name)}
+		}
+	}
+	return nil
+}

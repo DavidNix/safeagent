@@ -80,7 +80,10 @@ func TestCircuitBreaker_Complete(t *testing.T) {
 		var primaryHealthy atomic.Bool
 		primaryServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			primaryHits.Add(1)
-			captureJSONRequest(t, r, nil)
+			if err := captureJSONRequest(r, nil); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
 			if !primaryHealthy.Load() {
 				w.WriteHeader(http.StatusServiceUnavailable)
 				return

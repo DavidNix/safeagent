@@ -13,14 +13,20 @@ extensions such as vLLM's `reasoning_content` are first-class.
 
 ```go
 import (
+	"os"
+
 	"github.com/DavidNix/safeagent/agent"
 	"github.com/DavidNix/safeagent/llm"
 )
 
+model := llm.NewOpenRouter(llm.OpenRouterConfig{
+	APIKey:    os.Getenv("OPENROUTER_API_KEY"),
+	ChatModel: "openai/gpt-4.1",
+})
 assistant := &agent.Agent{
 	Name:         "Assistant",
 	Instructions: "You are a helpful assistant.",
-	Model:        llm.NewClient("gpt-4.1"), // reads OPENAI_API_KEY
+	Model:        model,
 }
 
 result, err := agent.Run(ctx, assistant, "What is the capital of France?")

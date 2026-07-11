@@ -3,6 +3,7 @@ package llm_test
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -188,6 +189,66 @@ func TestClient_Complete(t *testing.T) {
 		require.Equal(t, true, provider["zdr"])
 	})
 
+	t.Run("openrouter zero data retention overrides provider parent field", func(t *testing.T) {
+		var missingZDR atomic.Bool
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				missingZDR.Store(true)
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			var payload map[string]any
+			if err := json.Unmarshal(body, &payload); err != nil {
+				missingZDR.Store(true)
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			provider, ok := payload["provider"].(map[string]any)
+			if !ok || provider["zdr"] != true || provider["order"] == nil {
+				missingZDR.Store(true)
+			}
+			writeChatCompletion(w, "ok")
+		}))
+		t.Cleanup(server.Close)
+
+		client := llm.NewOpenRouter(llm.OpenRouterConfig{
+			BaseURL:                  server.URL,
+			ChatModel:                "test",
+			RequireZeroDataRetention: true,
+			ExtraFields: map[string]any{
+				"provider": map[string]any{"order": []string{"test-provider"}},
+			},
+		})
+		for range 100 {
+			_, err := client.Complete(t.Context(), llm.ChatRequest{Messages: []llm.ChatMessage{{Role: "user", Content: "hello"}}})
+			require.NoError(t, err)
+		}
+
+		require.False(t, missingZDR.Load())
+	})
+
+	t.Run("empty message content is serialized by role", func(t *testing.T) {
+		request := &capturedRequest{}
+		server := chatCompletionServer(t, http.StatusOK, "ok", request, nil)
+		t.Cleanup(server.Close)
+		client := llm.NewClient("test", llm.WithBaseURL(server.URL))
+
+		_, err := client.Complete(t.Context(), llm.ChatRequest{Messages: []llm.ChatMessage{
+			{Role: "system"},
+			{Role: "user"},
+			{Role: "assistant", ToolCalls: []llm.ChatToolCall{{ID: "call_1", Type: "function", Function: llm.ChatFunctionCall{Name: "empty", Arguments: "{}"}}}},
+			{Role: "tool", ToolCallID: "call_1"},
+		}})
+
+		require.NoError(t, err)
+		messages := request.JSONBody["messages"].([]any)
+		require.Equal(t, "", messages[0].(map[string]any)["content"])
+		require.Equal(t, "", messages[1].(map[string]any)["content"])
+		require.NotContains(t, messages[2].(map[string]any), "content")
+		require.Equal(t, "", messages[3].(map[string]any)["content"])
+	})
+
 	t.Run("zero reasoning budget disables vllm thinking", func(t *testing.T) {
 		request := &capturedRequest{}
 		server := chatCompletionServer(t, http.StatusOK, `{"ok":true}`, request, nil)
@@ -305,6 +366,27 @@ func TestClient_Complete(t *testing.T) {
 		require.Equal(t, int64(8), tooLarge.Limit)
 	})
 
+	for _, status := range []int{http.StatusTooManyRequests, http.StatusServiceUnavailable} {
+		t.Run(fmt.Sprintf("oversized status %d response falls back", status), func(t *testing.T) {
+			primaryServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(status)
+				_, _ = w.Write([]byte(strings.Repeat("x", 32)))
+			}))
+			t.Cleanup(primaryServer.Close)
+			fallbackServer := chatCompletionServer(t, http.StatusOK, "fallback", nil, nil)
+			t.Cleanup(fallbackServer.Close)
+
+			primary := llm.NewClient("primary", llm.WithBaseURL(primaryServer.URL), llm.WithMaxResponseBytes(8))
+			fallback := llm.NewClient("fallback", llm.WithBaseURL(fallbackServer.URL))
+			breaker := llm.NewCircuitBreaker(primary, fallback)
+
+			resp, err := breaker.Complete(t.Context(), llm.ChatRequest{Messages: []llm.ChatMessage{{Role: "user", Content: "hello"}}})
+
+			require.NoError(t, err)
+			require.Equal(t, "fallback", resp.Choices[0].Message.Content)
+		})
+	}
+
 	t.Run("response body close error is ignored", func(t *testing.T) {
 		closeErr := errors.New("close boom")
 		client := llm.NewClient("gpt-test", llm.WithHTTPClient(&http.Client{
@@ -388,7 +470,10 @@ func chatCompletionServer(t *testing.T, status int, content string, captured *ca
 		if hits != nil {
 			hits.Add(1)
 		}
-		captureJSONRequest(t, r, captured)
+		if err := captureJSONRequest(r, captured); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
 		if status >= http.StatusBadRequest {
 			w.WriteHeader(status)
 			return
@@ -402,7 +487,10 @@ func modelsServer(t *testing.T, status int, body string, captured *capturedReque
 
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		bodyBytes, err := io.ReadAll(r.Body)
-		require.NoError(t, err)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
 		if captured != nil {
 			captured.Method = r.Method
 			captured.Path = r.URL.Path
@@ -424,7 +512,10 @@ func rawJSONServer(t *testing.T, status int, body string) *httptest.Server {
 	t.Helper()
 
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		captureJSONRequest(t, r, nil)
+		if err := captureJSONRequest(r, nil); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
 		if status >= http.StatusBadRequest {
 			w.WriteHeader(status)
 			_, _ = w.Write([]byte(body))
@@ -435,15 +526,17 @@ func rawJSONServer(t *testing.T, status int, body string) *httptest.Server {
 	}))
 }
 
-func captureJSONRequest(t *testing.T, r *http.Request, captured *capturedRequest) {
-	t.Helper()
-
+func captureJSONRequest(r *http.Request, captured *capturedRequest) error {
 	body, err := io.ReadAll(r.Body)
-	require.NoError(t, err)
+	if err != nil {
+		return fmt.Errorf("read request body: %w", err)
+	}
 	var jsonBody map[string]any
-	require.NoError(t, json.Unmarshal(body, &jsonBody))
+	if err := json.Unmarshal(body, &jsonBody); err != nil {
+		return fmt.Errorf("decode request body: %w", err)
+	}
 	if captured == nil {
-		return
+		return nil
 	}
 	captured.Method = r.Method
 	captured.Path = r.URL.Path
@@ -451,6 +544,7 @@ func captureJSONRequest(t *testing.T, r *http.Request, captured *capturedRequest
 	captured.Header = r.Header.Clone()
 	captured.Body = body
 	captured.JSONBody = jsonBody
+	return nil
 }
 
 func writeChatCompletion(w http.ResponseWriter, content string) {

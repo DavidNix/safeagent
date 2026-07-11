@@ -4,7 +4,7 @@
 
 > **Warning: Nothing in this repository is stable at this time.** APIs, file layouts, and behavior may change or break without notice. Do not depend on it for anything.
 
-SafeAgent builds agents and agentic workflows with a security-first mindset. 
+SafeAgent builds agents and agentic workflows with a security-first mindset.
 
 ## The Lethal Trifecta
 
@@ -14,9 +14,9 @@ You are **not** safe from prompt injection if you allow an agent to combine all 
 2. **Untrusted content** — emails, web pages, documents, tool output, anything an attacker can influence
 3. **External communication** — outbound calls to the internet or other systems
 
-Any two are a risk; all three together is the lethal trifecta. An attacker who can plant instructions in untrusted content can exfiltrate private data through external communication. 
+Any two are a risk; all three together is the lethal trifecta. An attacker who can plant instructions in untrusted content can exfiltrate private data through external communication.
 
-SafeAgent exists to minmize that triangle by design, not by hope.
+SafeAgent exists to minimize that triangle by design, not by hope.
 
 ## Submodules
 
