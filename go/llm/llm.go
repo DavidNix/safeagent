@@ -1,41 +1,35 @@
 // Package llm provides plain-HTTP clients for OpenAI-compatible Chat
-// Completions APIs. It owns the wire-level request and response types and does
-// not depend on the agent runtime.
+// Completions and Embeddings APIs. It owns the wire-level request and response
+// types and does not depend on the agent runtime.
 package llm
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"maps"
-	"math/rand/v2"
 	"net"
 	"net/http"
 	"sort"
-	"strconv"
 	"strings"
-	"syscall"
 	"time"
 )
 
 const (
 	// DefaultBaseURL is the OpenRouter OpenAI-compatible API base URL.
 	DefaultBaseURL = "https://openrouter.ai/api/v1"
-	// DefaultMaxRetries is the default number of retries after a retryable
-	// failure. The default is zero so a CircuitBreaker can fail over after one
-	// trigger failure instead of waiting on local retries.
-	DefaultMaxRetries = 0
+	// DefaultRequestTimeout is the maximum duration of one provider request.
+	DefaultRequestTimeout = 60 * time.Second
 	// DefaultMaxResponseBytes caps response bodies at 64 MiB. This is generous
 	// for current OpenAI-compatible max completion sizes while still preventing
 	// accidental unbounded reads. Use WithMaxResponseBytes(0) to disable it.
 	DefaultMaxResponseBytes = 64 << 20
 
-	defaultHTTPTimeout         = 60 * time.Second
 	defaultDialTimeout         = 5 * time.Second
-	defaultRetryDelay          = 500 * time.Millisecond
 	defaultFailureThreshold    = 3
 	defaultOpenDuration        = 60 * time.Second
 	defaultSuccessfulProbePass = 1
@@ -45,16 +39,16 @@ const (
 
 // Client calls an OpenAI-compatible Chat Completions API.
 type Client struct {
-	model       string
-	apiKey      string
-	baseURL     string
-	httpClient  *http.Client
-	headers     map[string]string
-	queryParams map[string]string
-	extraFields map[string]any
-	maxRetries  int
-	maxRespBody int64
-	retryDelay  time.Duration
+	providerID     string
+	model          string
+	apiKey         string
+	baseURL        string
+	httpClient     *http.Client
+	headers        map[string]string
+	queryParams    map[string]string
+	extraFields    map[string]any
+	maxRespBody    int64
+	requestTimeout time.Duration
 }
 
 // Option customizes a Client.
@@ -63,6 +57,11 @@ type Option func(*Client)
 // WithAPIKey overrides the bearer token used for API requests.
 func WithAPIKey(key string) Option {
 	return func(c *Client) { c.apiKey = key }
+}
+
+// WithProviderID identifies the provider in circuit-breaker failover events.
+func WithProviderID(providerID string) Option {
+	return func(c *Client) { c.providerID = providerID }
 }
 
 // WithBaseURL overrides the API base URL, for example to point at vLLM or
@@ -93,37 +92,30 @@ func WithExtraFields(extraFields map[string]any) Option {
 	return func(c *Client) { c.extraFields = maps.Clone(extraFields) }
 }
 
-// WithMaxRetries overrides how many times the client retries retryable
-// failures. The default is zero; use a CircuitBreaker for immediate failover.
-func WithMaxRetries(n int) Option {
-	return func(c *Client) { c.maxRetries = n }
-}
-
 // WithMaxResponseBytes overrides the maximum response body size read by the
 // client. Zero or a negative value disables the limit.
 func WithMaxResponseBytes(n int64) Option {
 	return func(c *Client) { c.maxRespBody = n }
 }
 
-// WithRetryDelay overrides the base delay of the exponential backoff between
-// retries. A Retry-After response header takes precedence.
-func WithRetryDelay(d time.Duration) Option {
-	return func(c *Client) { c.retryDelay = d }
+// WithRequestTimeout overrides the maximum duration of one provider request.
+// Zero or a negative duration disables the client-level timeout.
+func WithRequestTimeout(timeout time.Duration) Option {
+	return func(c *Client) { c.requestTimeout = timeout }
 }
 
 // NewClient builds a Chat Completions client for model. By default it uses
-// DefaultBaseURL and zero retries.
+// DefaultBaseURL.
 func NewClient(model string, opts ...Option) *Client {
 	c := &Client{
-		model:       model,
-		baseURL:     DefaultBaseURL,
-		httpClient:  newDefaultHTTPClient(),
-		headers:     map[string]string{},
-		queryParams: map[string]string{},
-		extraFields: map[string]any{},
-		maxRetries:  DefaultMaxRetries,
-		maxRespBody: DefaultMaxResponseBytes,
-		retryDelay:  defaultRetryDelay,
+		model:          model,
+		baseURL:        DefaultBaseURL,
+		httpClient:     newDefaultHTTPClient(),
+		headers:        map[string]string{},
+		queryParams:    map[string]string{},
+		extraFields:    map[string]any{},
+		maxRespBody:    DefaultMaxResponseBytes,
+		requestTimeout: DefaultRequestTimeout,
 	}
 	for _, opt := range opts {
 		opt(c)
@@ -145,6 +137,7 @@ func NewClient(model string, opts ...Option) *Client {
 
 // VLLMConfig configures a vLLM OpenAI-compatible Chat Completions client.
 type VLLMConfig struct {
+	ProviderID  string
 	APIKey      string
 	ChatBaseURL string
 	ChatModel   string
@@ -160,10 +153,7 @@ type VLLMConfig struct {
 // NewVLLM builds a vLLM Chat Completions client. If APIKey is empty, the
 // client uses "local" because local vLLM deployments commonly ignore auth.
 func NewVLLM(cfg VLLMConfig) *Client {
-	apiKey := cfg.APIKey
-	if apiKey == "" {
-		apiKey = defaultLocalAPIKey
-	}
+	apiKey := cmp.Or(cfg.APIKey, defaultLocalAPIKey)
 	extraFields := maps.Clone(cfg.ExtraFields)
 	if extraFields == nil {
 		extraFields = map[string]any{}
@@ -171,6 +161,7 @@ func NewVLLM(cfg VLLMConfig) *Client {
 	maps.Copy(extraFields, vllmReasoningFields(cfg.ReasoningTokenBudget))
 
 	return NewClient(cfg.ChatModel,
+		WithProviderID(cfg.ProviderID),
 		WithAPIKey(apiKey),
 		WithBaseURL(cfg.ChatBaseURL),
 		WithHeaders(cfg.Headers),
@@ -182,6 +173,7 @@ func NewVLLM(cfg VLLMConfig) *Client {
 // OpenRouterConfig configures OpenRouter's OpenAI-compatible Chat Completions
 // API.
 type OpenRouterConfig struct {
+	ProviderID               string
 	APIKey                   string
 	BaseURL                  string
 	ChatModel                string
@@ -196,10 +188,7 @@ type OpenRouterConfig struct {
 // NewOpenRouter builds an OpenRouter Chat Completions client. If BaseURL is
 // empty, the OpenRouter API base URL is used.
 func NewOpenRouter(cfg OpenRouterConfig) *Client {
-	baseURL := cfg.BaseURL
-	if baseURL == "" {
-		baseURL = defaultOpenRouterBaseURL
-	}
+	baseURL := cmp.Or(cfg.BaseURL, defaultOpenRouterBaseURL)
 	headers := map[string]string{}
 	if cfg.SiteURL != "" {
 		headers["HTTP-Referer"] = cfg.SiteURL
@@ -218,6 +207,7 @@ func NewOpenRouter(cfg OpenRouterConfig) *Client {
 	}
 
 	return NewClient(cfg.ChatModel,
+		WithProviderID(cfg.ProviderID),
 		WithAPIKey(cfg.APIKey),
 		WithBaseURL(baseURL),
 		WithHeaders(headers),
@@ -229,13 +219,34 @@ func NewOpenRouter(cfg OpenRouterConfig) *Client {
 // ChatRequest is an OpenAI-compatible Chat Completions request without the
 // model field. Client injects its configured model into each request.
 type ChatRequest struct {
-	Messages          []ChatMessage `json:"messages"`
-	Tools             []ChatTool    `json:"tools,omitempty"`
-	Temperature       *float64      `json:"temperature,omitempty"`
-	TopP              *float64      `json:"top_p,omitempty"`
-	MaxTokens         *int          `json:"max_completion_tokens,omitempty"`
-	ParallelToolCalls *bool         `json:"parallel_tool_calls,omitempty"`
-	ToolChoice        any           `json:"tool_choice,omitempty"`
+	Messages          []ChatMessage     `json:"messages"`
+	Tools             []ChatTool        `json:"tools,omitempty"`
+	Temperature       *float64          `json:"temperature,omitempty"`
+	TopP              *float64          `json:"top_p,omitempty"`
+	MaxTokens         *int              `json:"max_completion_tokens,omitempty"`
+	ParallelToolCalls *bool             `json:"parallel_tool_calls,omitempty"`
+	ToolChoice        any               `json:"tool_choice,omitempty"`
+	StructuredOutput  *StructuredOutput `json:"-"`
+}
+
+// StructuredOutput constrains a chat completion to a JSON Schema. Providers
+// must support OpenAI-compatible strict structured outputs.
+//
+// Example:
+//
+//	request := llm.ChatRequest{
+//		Messages: []llm.ChatMessage{{Role: "user", Content: "Give me an answer."}},
+//		StructuredOutput: &llm.StructuredOutput{
+//			Name:   "answer",
+//			Schema: json.RawMessage(`{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"],"additionalProperties":false}`),
+//			Strict: true,
+//		},
+//	}
+type StructuredOutput struct {
+	Name        string          `json:"name"`
+	Description string          `json:"description,omitempty"`
+	Schema      json.RawMessage `json:"schema"`
+	Strict      bool            `json:"strict,omitempty"`
 }
 
 // ChatFunctionCall is a tool/function call payload in a chat message.
@@ -348,74 +359,92 @@ type ModelsResponse struct {
 	Data   []ModelInfo `json:"data"`
 }
 
-// StatusError reports a non-200 response from the Chat Completions API.
+// StatusError reports a non-200 response from a provider API.
 type StatusError struct {
 	StatusCode int
 	Body       string
-	RetryAfter string
+	operation  string
 }
 
 func (e *StatusError) Error() string {
+	operation := cmp.Or(e.operation, "chat completions")
 	body := strings.TrimSpace(e.Body)
 	if body == "" {
-		return fmt.Sprintf("chat completions returned status %d", e.StatusCode)
+		return fmt.Sprintf("%s returned status %d", operation, e.StatusCode)
 	}
-	return fmt.Sprintf("chat completions returned status %d: %s", e.StatusCode, body)
+	return fmt.Sprintf("%s returned status %d: %s", operation, e.StatusCode, body)
 }
 
 // ResponseTooLargeError reports a response body that exceeded the configured
 // maximum response size.
 type ResponseTooLargeError struct {
-	Limit int64
+	Limit     int64
+	operation string
 }
 
 func (e *ResponseTooLargeError) Error() string {
-	return fmt.Sprintf("chat completions response exceeded %d bytes", e.Limit)
+	operation := cmp.Or(e.operation, "chat completions")
+	return fmt.Sprintf("%s response exceeded %d bytes", operation, e.Limit)
 }
 
 type wireChatRequest struct {
-	Model string `json:"model"`
+	Model          string              `json:"model"`
+	ResponseFormat *wireResponseFormat `json:"response_format,omitempty"`
 	ChatRequest
 }
 
-// Complete sends a Chat Completions request. The client defaults to zero
-// retries; configure retries explicitly or wrap clients in CircuitBreaker for
-// immediate failover on retryable provider and transport failures.
+type wireResponseFormat struct {
+	Type       string            `json:"type"`
+	JSONSchema *StructuredOutput `json:"json_schema"`
+}
+
+type requestSerializationError struct {
+	operation string
+	err       error
+}
+
+func (e *requestSerializationError) Error() string {
+	return fmt.Sprintf("marshal %s request: %v", e.operation, e.err)
+}
+
+func (e *requestSerializationError) Unwrap() error {
+	return e.err
+}
+
+// Complete sends one Chat Completions request.
 func (c *Client) Complete(ctx context.Context, req ChatRequest) (*ChatResponse, error) {
+	body, err := c.prepareChatRequest(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	return c.complete(ctx, body)
+}
+
+func (c *Client) prepareChatRequest(ctx context.Context, req ChatRequest) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	body, err := c.marshalRequest(req)
 	if err != nil {
-		return nil, fmt.Errorf("marshal chat completions request: %w", err)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
+		return nil, &requestSerializationError{operation: "chat completions", err: err}
 	}
+	return body, nil
+}
 
-	var lastErr error
-	for attempt := 0; ; attempt++ {
-		if attempt > 0 {
-			select {
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			case <-time.After(c.backoff(attempt, lastErr)):
-			}
-		}
-		resp, err := c.roundTrip(ctx, body)
-		if err != nil {
-			if !isTriggerError(ctx, err) {
-				return nil, err
-			}
-			lastErr = err
-			if attempt >= c.maxRetries {
-				if c.maxRetries == 0 {
-					return nil, err
-				}
-				return nil, fmt.Errorf("chat completions failed after %d attempts: %w", attempt+1, lastErr)
-			}
-			continue
-		}
-		return resp, nil
-	}
+func (c *Client) complete(ctx context.Context, body []byte) (*ChatResponse, error) {
+	ctx, cancel := c.requestContext(ctx)
+	defer cancel()
+	return c.roundTrip(ctx, body)
 }
 
 // Models returns the models advertised by the configured OpenAI-compatible API.
 func (c *Client) Models(ctx context.Context) (*ModelsResponse, error) {
+	ctx, cancel := c.requestContext(ctx)
+	defer cancel()
+
 	endpoint, err := c.endpoint("models")
 	if err != nil {
 		return nil, err
@@ -451,7 +480,11 @@ func (c *Client) Models(ctx context.Context) (*ModelsResponse, error) {
 }
 
 func (c *Client) marshalRequest(req ChatRequest) ([]byte, error) {
-	body, err := json.Marshal(wireChatRequest{Model: c.model, ChatRequest: req})
+	wireReq := wireChatRequest{Model: c.model, ChatRequest: req}
+	if req.StructuredOutput != nil {
+		wireReq.ResponseFormat = &wireResponseFormat{Type: "json_schema", JSONSchema: req.StructuredOutput}
+	}
+	body, err := json.Marshal(wireReq)
 	if err != nil {
 		return nil, err
 	}
@@ -462,20 +495,12 @@ func (c *Client) marshalRequest(req ChatRequest) ([]byte, error) {
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return nil, err
 	}
+	responseFormat := payload["response_format"]
 	applyExtraFields(payload, c.extraFields)
-	return json.Marshal(payload)
-}
-
-func (c *Client) backoff(attempt int, lastErr error) time.Duration {
-	var statusErr *StatusError
-	if errors.As(lastErr, &statusErr) && statusErr.RetryAfter != "" {
-		secs, err := strconv.Atoi(statusErr.RetryAfter)
-		if err == nil && secs >= 0 {
-			return time.Duration(secs) * time.Second
-		}
+	if responseFormat != nil {
+		payload["response_format"] = responseFormat
 	}
-	delay := c.retryDelay << (attempt - 1)
-	return delay + rand.N(delay/4+1)
+	return json.Marshal(payload)
 }
 
 func (c *Client) roundTrip(ctx context.Context, body []byte) (*ChatResponse, error) {
@@ -508,7 +533,6 @@ func (c *Client) roundTrip(ctx context.Context, body []byte) (*ChatResponse, err
 		return nil, &StatusError{
 			StatusCode: resp.StatusCode,
 			Body:       string(respBody),
-			RetryAfter: resp.Header.Get("Retry-After"),
 		}
 	}
 	if err != nil {
@@ -566,40 +590,11 @@ func readResponseBody(r io.Reader, limit int64) ([]byte, error) {
 	return body, nil
 }
 
-// isTriggerError reports whether err should trigger retry, fallback, or opening
-// the circuit. It only treats transient provider or transport failures as
-// triggers; caller cancellation and non-retryable API errors are not triggers.
-func isTriggerError(ctx context.Context, err error) bool {
-	if err == nil {
-		return false
+func (c *Client) requestContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if c.requestTimeout <= 0 {
+		return ctx, func() {}
 	}
-	if errors.Is(err, context.Canceled) {
-		return false
-	}
-	if errors.Is(err, context.DeadlineExceeded) {
-		return ctx.Err() == nil
-	}
-
-	if statusErr, ok := errors.AsType[*StatusError](err); ok {
-		switch {
-		case statusErr.StatusCode >= http.StatusInternalServerError:
-			return true
-		case statusErr.StatusCode == http.StatusTooManyRequests:
-			return true
-		default:
-			return false
-		}
-	}
-
-	if _, ok := errors.AsType[net.Error](err); ok {
-		return true
-	}
-
-	if errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, io.EOF) {
-		return true
-	}
-
-	return false
+	return context.WithTimeout(ctx, c.requestTimeout)
 }
 
 func newDefaultHTTPClient() *http.Client {
@@ -607,7 +602,6 @@ func newDefaultHTTPClient() *http.Client {
 	transport.DialContext = (&net.Dialer{Timeout: defaultDialTimeout}).DialContext
 	return &http.Client{
 		Transport: transport,
-		Timeout:   defaultHTTPTimeout,
 	}
 }
 

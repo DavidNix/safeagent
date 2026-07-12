@@ -5,8 +5,8 @@ A Go port of the core runtime of the [OpenAI Agents SDK](https://github.com/open
 guardrails, and a run loop that drives a model until a final output.
 
 The `agent` package is provider-agnostic. The top-level `llm` package provides
-plain-HTTP clients for OpenAI-compatible Chat Completions APIs (OpenAI,
-OpenRouter, Ollama, vLLM, etc.). It owns the wire types, so provider
+plain-HTTP clients for OpenAI-compatible Chat Completions and Embeddings APIs
+(OpenAI, OpenRouter, Ollama, vLLM, etc.). It owns the wire types, so provider
 extensions such as vLLM's `reasoning_content` are first-class.
 
 ## Quick start
@@ -214,7 +214,41 @@ ag.InstructionsFunc = func(ctx context.Context, rc *agent.RunContext, a *agent.A
 
 `ModelSettings` tunes generation per agent: `Temperature`, `TopP`,
 `MaxTokens`, `ParallelToolCalls` (nil pointers are omitted from the request),
-and `ToolChoice` (`"auto"`, `"required"`, `"none"`, or a tool name to force).
+`ToolChoice` (`"auto"`, `"required"`, `"none"`, or a tool name to force), and
+`StructuredOutput`.
+
+`StructuredOutput` requests modern JSON Schema structured output. The client
+does not expose the legacy `json_object` mode and does not validate the model's
+response locally; `RunResult.FinalOutput` remains a JSON string. Provider and
+model support varies.
+
+```go
+schema := json.RawMessage(`{
+  "type": "object",
+  "properties": {
+    "answer": {"type": "string"}
+  },
+  "required": ["answer"],
+  "additionalProperties": false
+}`)
+
+assistant := &agent.Agent{
+  Name:  "Structured assistant",
+  Model: model,
+  ModelSettings: agent.ModelSettings{
+    StructuredOutput: &llm.StructuredOutput{
+      Name:        "answer",
+      Description: "A concise answer",
+      Schema:      schema,
+      Strict:      true,
+    },
+  },
+}
+```
+
+The same type can be set directly on `llm.ChatRequest.StructuredOutput`. An
+explicit structured output takes precedence over a conflicting static
+`response_format` in `WithExtraFields`.
 
 A forced `ToolChoice` is a one-shot constraint: once an agent has executed
 tool calls in a run, any `ToolChoice` other than `"none"` is dropped from
@@ -277,9 +311,68 @@ in the same way.
 The `llm` package options include `llm.WithBaseURL` (point it at any
 OpenAI-compatible server), `llm.WithAPIKey`, `llm.WithHTTPClient`, static
 headers/query params, and constructor-level JSON extra fields for provider
-extensions. `llm.Client` defaults to zero retries; configure
-`llm.WithMaxRetries` explicitly or wrap clients in `llm.CircuitBreaker` for
-immediate failover on HTTP 429, 5xx, and transport failures.
+extensions. Each client is attempted once and has a 60-second request timeout
+by default. Use `llm.WithRequestTimeout` to change it; zero or a negative
+duration disables the client-level timeout.
+
+The package-created HTTP client has no separate `http.Client.Timeout`. A custom
+client passed through `llm.WithHTTPClient` keeps its own timeout, so the
+effective limit is the earliest of the caller context deadline, the SafeAgent
+request timeout, and the custom HTTP timeout.
+
+Wrap clients in `llm.CircuitBreaker` to try configured fallbacks when a request
+fails. Each provider gets a fresh request timeout derived from the caller's
+context. Cancellation, expiration, and request serialization errors stop the
+chain immediately. HTTP 400, 412, 422, other unclassified 4xx responses, and
+local response-size limit errors fall back without counting against the
+primary. HTTP 401, 403, 404, 408, 413, 429, 5xx responses, transport errors,
+provider timeouts, and unusable successful responses count against it.
+
+Use `WithProviderID` or the provider configuration's `ProviderID` field with
+`BreakerConfig.OnFailover` to observe errors that cause another provider to be
+attempted. Routing directly to a fallback while the circuit is already open
+does not emit an event. The callback runs synchronously outside the breaker
+lock and must be safe for concurrent use:
+
+```go
+breaker := llm.NewCircuitBreakerWithConfig(llm.BreakerConfig{
+	OnFailover: func(ctx context.Context, event llm.FailoverEvent) {
+		slog.WarnContext(ctx, "Failing over LLM provider",
+			"from", event.FromProvider,
+			"from_index", event.FromProviderIndex,
+			"to", event.ToProvider,
+			"error", event.Error,
+			"counted", event.CountedAgainstBreaker,
+		)
+	},
+}, primary, fallback)
+```
+
+For embeddings, use `llm.NewEmbeddingClient`, `llm.NewVLLMEmbedding`, or
+`llm.NewOpenRouterEmbedding`. `llm.EmbeddingCircuitBreaker` provides the same
+failover behavior:
+
+```go
+primary := llm.NewVLLMEmbedding(llm.VLLMEmbeddingConfig{
+	ProviderID: "vllm-primary",
+	BaseURL:    "http://ai1-inference:8001/v1",
+	Model:      "BAAI/bge-m3",
+})
+fallback := llm.NewOpenRouterEmbedding(llm.OpenRouterEmbeddingConfig{
+	ProviderID: "openrouter-fallback",
+	APIKey:     os.Getenv("OPENROUTER_API_KEY"),
+	Model:      "baai/bge-m3",
+})
+embedder := llm.NewEmbeddingCircuitBreaker(primary, fallback)
+response, err := embedder.Embed(ctx, llm.EmbeddingRequest{
+	Input: []string{"first document", "second document"},
+})
+```
+
+The library does not validate embedding-model compatibility. Callers must
+configure every fallback to use the same model weights and embedding settings
+as the primary. Equal vector dimensions and similar model names do not make
+embeddings from different models compatible.
 
 Reasoning models served with a reasoning parser (for example
 `vllm serve ... --reasoning-parser deepseek_r1`) return their thinking in a

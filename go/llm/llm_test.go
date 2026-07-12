@@ -1,6 +1,7 @@
 package llm_test
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/DavidNix/safeagent/llm"
@@ -46,6 +48,17 @@ func TestClient_Complete(t *testing.T) {
 		runLLMReasoningE2ECompletion(t, ctx, client, "SAFEAGENT_LLM_OPENROUTER_REASONING_E2E")
 	})
 
+	t.Run("e2e openrouter structured output", func(t *testing.T) {
+		skipE2EInShortMode(t)
+		apiKey := requireE2EEnv(t, openRouterAPIKeyEnv)
+		ctx, cancel := e2eContext(t)
+		defer cancel()
+
+		client := newOpenRouterE2EClient(apiKey, "")
+
+		runLLMStructuredOutputE2E(t, ctx, client, "SAFEAGENT_LLM_OPENROUTER_STRUCTURED_E2E")
+	})
+
 	t.Run("e2e vllm client", func(t *testing.T) {
 		skipE2EInShortMode(t)
 		baseURL := requireE2EEnv(t, vllmBaseURLEnv)
@@ -66,6 +79,17 @@ func TestClient_Complete(t *testing.T) {
 		client := newVLLMReasoningE2EClient(t, ctx, baseURL)
 
 		runLLMReasoningE2ECompletion(t, ctx, client, "SAFEAGENT_LLM_VLLM_REASONING_E2E")
+	})
+
+	t.Run("e2e vllm structured output", func(t *testing.T) {
+		skipE2EInShortMode(t)
+		baseURL := requireE2EEnv(t, vllmBaseURLEnv)
+		ctx, cancel := e2eContext(t)
+		defer cancel()
+
+		client := newVLLME2EClient(t, ctx, baseURL)
+
+		runLLMStructuredOutputE2E(t, ctx, client, "SAFEAGENT_LLM_VLLM_STRUCTURED_E2E")
 	})
 
 	t.Run("happy path sends chat completion request and decodes api response", func(t *testing.T) {
@@ -140,6 +164,56 @@ func TestClient_Complete(t *testing.T) {
 		require.Equal(t, "final", resp.Choices[0].Message.Content)
 	})
 
+	t.Run("structured output serializes json schema and overrides extra fields", func(t *testing.T) {
+		request := &capturedRequest{}
+		server := chatCompletionServer(t, http.StatusOK, `{"answer":"done"}`, request, nil)
+		t.Cleanup(server.Close)
+		client := llm.NewClient("gpt-test",
+			llm.WithBaseURL(server.URL),
+			llm.WithExtraFields(map[string]any{
+				"response_format": map[string]any{"type": "conflicting"},
+			}),
+		)
+		schema := json.RawMessage(`{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"],"additionalProperties":false}`)
+
+		_, err := client.Complete(t.Context(), llm.ChatRequest{
+			Messages: []llm.ChatMessage{{Role: "user", Content: "answer"}},
+			StructuredOutput: &llm.StructuredOutput{
+				Name:        "answer",
+				Description: "A concise answer",
+				Schema:      schema,
+				Strict:      true,
+			},
+		})
+
+		require.NoError(t, err)
+		responseFormat, err := json.Marshal(request.JSONBody["response_format"])
+		require.NoError(t, err)
+		require.JSONEq(t, `{
+			"type":"json_schema",
+			"json_schema":{
+				"name":"answer",
+				"description":"A concise answer",
+				"schema":{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"],"additionalProperties":false},
+				"strict":true
+			}
+		}`, string(responseFormat))
+	})
+
+	t.Run("invalid structured output schema fails before provider request", func(t *testing.T) {
+		var hits atomic.Int32
+		server := chatCompletionServer(t, http.StatusOK, "unused", nil, &hits)
+		t.Cleanup(server.Close)
+		client := llm.NewClient("gpt-test", llm.WithBaseURL(server.URL))
+
+		_, err := client.Complete(t.Context(), llm.ChatRequest{
+			StructuredOutput: &llm.StructuredOutput{Name: "invalid", Schema: json.RawMessage(`{`)},
+		})
+
+		require.EqualError(t, err, "marshal chat completions request: json: error calling MarshalJSON for type json.RawMessage: unexpected end of JSON input")
+		require.Equal(t, int32(0), hits.Load())
+	})
+
 	t.Run("provider constructors apply openrouter and vllm configuration", func(t *testing.T) {
 		primaryRequest := &capturedRequest{}
 		primaryServer := chatCompletionServer(t, http.StatusServiceUnavailable, "", primaryRequest, nil)
@@ -151,11 +225,13 @@ func TestClient_Complete(t *testing.T) {
 
 		budget := 128
 		primary := llm.NewVLLM(llm.VLLMConfig{
+			ProviderID:           "vllm-primary",
 			ChatBaseURL:          primaryServer.URL,
 			ChatModel:            "vllm-chat",
 			ReasoningTokenBudget: &budget,
 		})
 		fallback := llm.NewOpenRouter(llm.OpenRouterConfig{
+			ProviderID:               "openrouter-fallback",
 			APIKey:                   "openrouter-key",
 			BaseURL:                  fallbackServer.URL,
 			ChatModel:                "openrouter-chat",
@@ -165,7 +241,12 @@ func TestClient_Complete(t *testing.T) {
 			Headers:                  map[string]string{"X-OpenRouter-Test": "yes"},
 			QueryParams:              map[string]string{"route": "openrouter"},
 		})
-		breaker := llm.NewCircuitBreaker(primary, fallback)
+		events := make(chan llm.FailoverEvent, 1)
+		breaker := llm.NewCircuitBreakerWithConfig(llm.BreakerConfig{
+			OnFailover: func(_ context.Context, event llm.FailoverEvent) {
+				events <- event
+			},
+		}, primary, fallback)
 
 		resp, err := breaker.Complete(t.Context(), llm.ChatRequest{Messages: []llm.ChatMessage{{Role: "user", Content: "hello"}}})
 
@@ -187,6 +268,9 @@ func TestClient_Complete(t *testing.T) {
 		provider, ok := fallbackRequest.JSONBody["provider"].(map[string]any)
 		require.True(t, ok)
 		require.Equal(t, true, provider["zdr"])
+		event := <-events
+		require.Equal(t, "vllm-primary", event.FromProvider)
+		require.Equal(t, "openrouter-fallback", event.ToProvider)
 	})
 
 	t.Run("openrouter zero data retention overrides provider parent field", func(t *testing.T) {
@@ -279,12 +363,12 @@ func TestClient_Complete(t *testing.T) {
 		require.Equal(t, "none", reasoning["effort"])
 	})
 
-	t.Run("non-trigger status error does not retry", func(t *testing.T) {
+	t.Run("status error makes one request", func(t *testing.T) {
 		var attempts atomic.Int32
 		server := chatCompletionServer(t, http.StatusBadRequest, "", nil, &attempts)
 		t.Cleanup(server.Close)
 
-		client := llm.NewClient("gpt-test", llm.WithBaseURL(server.URL), llm.WithRetryDelay(time.Millisecond))
+		client := llm.NewClient("gpt-test", llm.WithBaseURL(server.URL))
 
 		_, err := client.Complete(t.Context(), llm.ChatRequest{Messages: []llm.ChatMessage{{Role: "user", Content: "hi"}}})
 
@@ -295,12 +379,12 @@ func TestClient_Complete(t *testing.T) {
 		require.Equal(t, http.StatusBadRequest, statusErr.StatusCode)
 	})
 
-	t.Run("retries are disabled by default", func(t *testing.T) {
+	t.Run("server error makes one request", func(t *testing.T) {
 		var attempts atomic.Int32
 		server := chatCompletionServer(t, http.StatusInternalServerError, "", nil, &attempts)
 		t.Cleanup(server.Close)
 
-		client := llm.NewClient("gpt-test", llm.WithBaseURL(server.URL), llm.WithRetryDelay(time.Millisecond))
+		client := llm.NewClient("gpt-test", llm.WithBaseURL(server.URL))
 
 		_, err := client.Complete(t.Context(), llm.ChatRequest{Messages: []llm.ChatMessage{{Role: "user", Content: "hi"}}})
 
@@ -308,48 +392,50 @@ func TestClient_Complete(t *testing.T) {
 		require.Equal(t, int32(1), attempts.Load())
 	})
 
-	t.Run("configured retries then succeeds", func(t *testing.T) {
-		var attempts atomic.Int32
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-			if attempts.Add(1) <= 2 {
-				w.WriteHeader(http.StatusInternalServerError)
-				_, _ = w.Write([]byte("boom"))
-				return
-			}
-			writeChatCompletion(w, `{"ok":true}`)
-		}))
-		t.Cleanup(server.Close)
+	t.Run("request timeout cancels one provider attempt", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			client := llm.NewClient("gpt-test",
+				llm.WithRequestTimeout(time.Second),
+				llm.WithHTTPClient(&http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+					<-req.Context().Done()
+					return nil, req.Context().Err()
+				})}),
+			)
 
+			_, err := client.Complete(t.Context(), llm.ChatRequest{Messages: []llm.ChatMessage{{Role: "user", Content: "hi"}}})
+
+			require.ErrorIs(t, err, context.DeadlineExceeded)
+		})
+	})
+
+	t.Run("caller cancellation takes precedence over serialization", func(t *testing.T) {
+		client := llm.NewClient("gpt-test")
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+
+		_, err := client.Complete(ctx, llm.ChatRequest{ToolChoice: func() {}})
+
+		require.ErrorIs(t, err, context.Canceled)
+	})
+
+	t.Run("zero request timeout disables client deadline", func(t *testing.T) {
 		client := llm.NewClient("gpt-test",
-			llm.WithBaseURL(server.URL),
-			llm.WithMaxRetries(2),
-			llm.WithRetryDelay(time.Millisecond),
+			llm.WithRequestTimeout(0),
+			llm.WithHTTPClient(&http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				_, hasDeadline := req.Context().Deadline()
+				require.False(t, hasDeadline)
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     make(http.Header),
+					Body:       io.NopCloser(strings.NewReader(chatCompletionJSON("ok"))),
+				}, nil
+			})}),
 		)
+
 		resp, err := client.Complete(t.Context(), llm.ChatRequest{Messages: []llm.ChatMessage{{Role: "user", Content: "hi"}}})
 
 		require.NoError(t, err)
-		require.Equal(t, "chatcmpl-test", resp.ID)
-		require.Equal(t, int32(3), attempts.Load())
-	})
-
-	t.Run("configured retries exhausted", func(t *testing.T) {
-		var attempts atomic.Int32
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-			attempts.Add(1)
-			w.WriteHeader(http.StatusInternalServerError)
-			_, _ = w.Write([]byte("boom"))
-		}))
-		t.Cleanup(server.Close)
-
-		client := llm.NewClient("gpt-test",
-			llm.WithBaseURL(server.URL),
-			llm.WithMaxRetries(1),
-			llm.WithRetryDelay(time.Millisecond),
-		)
-		_, err := client.Complete(t.Context(), llm.ChatRequest{Messages: []llm.ChatMessage{{Role: "user", Content: "hi"}}})
-
-		require.EqualError(t, err, "chat completions failed after 2 attempts: chat completions returned status 500: boom")
-		require.Equal(t, int32(2), attempts.Load())
+		require.Equal(t, "ok", resp.Choices[0].Message.Content)
 	})
 
 	t.Run("response body exceeding limit returns typed error", func(t *testing.T) {
@@ -451,6 +537,22 @@ func TestClient_Models(t *testing.T) {
 		_, err := client.Models(t.Context())
 
 		require.EqualError(t, err, "models returned status 503: down")
+	})
+
+	t.Run("request timeout", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			client := llm.NewClient("ignored",
+				llm.WithRequestTimeout(time.Second),
+				llm.WithHTTPClient(&http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+					<-req.Context().Done()
+					return nil, req.Context().Err()
+				})}),
+			)
+
+			_, err := client.Models(t.Context())
+
+			require.ErrorIs(t, err, context.DeadlineExceeded)
+		})
 	})
 }
 

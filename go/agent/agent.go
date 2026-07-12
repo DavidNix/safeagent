@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -41,10 +42,7 @@ type Agent struct {
 // completion on a string input and returns its final output. The nested
 // run's usage is added to the parent run.
 func (a *Agent) AsTool(name, description string) Tool {
-	toolName := name
-	if toolName == "" {
-		toolName = toFunctionToolName(a.Name)
-	}
+	toolName := cmp.Or(name, toFunctionToolName(a.Name))
 	return Tool{
 		Name:        toolName,
 		Description: description,

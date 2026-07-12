@@ -2,6 +2,7 @@ package llm_test
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"strings"
 	"testing"
@@ -12,13 +13,15 @@ import (
 )
 
 const (
-	openRouterAPIKeyEnv             = "OPENROUTER_API_KEY"
-	openRouterE2EModel              = "qwen/qwen3.6-35b-a3b"
-	vllmBaseURLEnv                  = "VLLM_BASE_URL"
-	e2eTimeout                      = 2 * time.Minute
-	e2eMaxCompletionTokens          = 32
-	e2eReasoningTokenBudget         = 256
-	e2eReasoningMaxCompletionTokens = 768
+	openRouterAPIKeyEnv              = "OPENROUTER_API_KEY"
+	openRouterE2EModel               = "qwen/qwen3.6-35b-a3b"
+	vllmBaseURLEnv                   = "VLLM_BASE_URL"
+	vllmEmbeddingBaseURLEnv          = "VLLM_EMBEDDING_BASE_URL"
+	e2eTimeout                       = 2 * time.Minute
+	e2eMaxCompletionTokens           = 32
+	e2eReasoningTokenBudget          = 256
+	e2eReasoningMaxCompletionTokens  = 768
+	e2eStructuredMaxCompletionTokens = 128
 )
 
 type e2eChatCompleter interface {
@@ -149,5 +152,45 @@ func runLLMReasoningE2ECompletion(t *testing.T, ctx context.Context, client e2eC
 	require.NotEmpty(t, resp.Choices)
 	require.NotEmpty(t, resp.Choices[0].Message.ReasoningContent)
 	require.Contains(t, resp.Choices[0].Message.Content, marker)
+	return resp
+}
+
+func runLLMStructuredOutputE2E(t *testing.T, ctx context.Context, client e2eChatCompleter, marker string) *llm.ChatResponse {
+	t.Helper()
+	temperature := 0.0
+	maxTokens := e2eStructuredMaxCompletionTokens
+	resp, err := client.Complete(ctx, llm.ChatRequest{
+		Messages: []llm.ChatMessage{
+			{Role: "system", Content: "You are running a SafeAgent structured-output end-to-end test. Follow the supplied JSON Schema exactly."},
+			{Role: "user", Content: "Set marker to exactly " + marker + " and passed to true."},
+		},
+		Temperature: &temperature,
+		MaxTokens:   &maxTokens,
+		StructuredOutput: &llm.StructuredOutput{
+			Name:        "safeagent_e2e_result",
+			Description: "The result of a SafeAgent structured-output end-to-end test.",
+			Schema: json.RawMessage(`{
+				"type":"object",
+				"properties":{
+					"marker":{"type":"string"},
+					"passed":{"type":"boolean"}
+				},
+				"required":["marker","passed"],
+				"additionalProperties":false
+			}`),
+			Strict: true,
+		},
+	})
+
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	require.NotEmpty(t, resp.Choices)
+	var output struct {
+		Marker string `json:"marker"`
+		Passed bool   `json:"passed"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(resp.Choices[0].Message.Content), &output))
+	require.Equal(t, marker, output.Marker)
+	require.True(t, output.Passed)
 	return resp
 }

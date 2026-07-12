@@ -1,10 +1,15 @@
 package llm_test
 
 import (
+	"context"
+	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/DavidNix/safeagent/llm"
@@ -14,7 +19,177 @@ import (
 func TestCircuitBreaker_Complete(t *testing.T) {
 	t.Parallel()
 
-	t.Run("trigger failure falls back and non-trigger does not", func(t *testing.T) {
+	t.Run("serialization error does not fall back", func(t *testing.T) {
+		var fallbackHits atomic.Int32
+		fallbackServer := chatCompletionServer(t, http.StatusOK, "fallback", nil, &fallbackHits)
+		t.Cleanup(fallbackServer.Close)
+		primary := llm.NewClient("primary")
+		fallback := llm.NewClient("fallback", llm.WithBaseURL(fallbackServer.URL))
+		breaker := llm.NewCircuitBreaker(primary, fallback)
+
+		_, err := breaker.Complete(t.Context(), llm.ChatRequest{ToolChoice: func() {}})
+
+		require.EqualError(t, err, "marshal chat completions request: json: unsupported type: func()")
+		require.Equal(t, int32(0), fallbackHits.Load())
+	})
+
+	t.Run("fallback serialization error stops chain", func(t *testing.T) {
+		primaryServer := chatCompletionServer(t, http.StatusInternalServerError, "", nil, nil)
+		t.Cleanup(primaryServer.Close)
+		var finalHits atomic.Int32
+		finalServer := chatCompletionServer(t, http.StatusOK, "final", nil, &finalHits)
+		t.Cleanup(finalServer.Close)
+		primary := llm.NewClient("primary", llm.WithBaseURL(primaryServer.URL))
+		invalid := llm.NewClient("invalid", llm.WithExtraFields(map[string]any{"invalid": func() {}}))
+		final := llm.NewClient("final", llm.WithBaseURL(finalServer.URL))
+		breaker := llm.NewCircuitBreaker(primary, invalid, final)
+
+		_, err := breaker.Complete(t.Context(), llm.ChatRequest{})
+
+		require.EqualError(t, err, "marshal chat completions request: json: unsupported type: func()")
+		require.Equal(t, int32(0), finalHits.Load())
+	})
+
+	t.Run("structured output is preserved during fallback", func(t *testing.T) {
+		primaryServer := chatCompletionServer(t, http.StatusInternalServerError, "", nil, nil)
+		t.Cleanup(primaryServer.Close)
+		fallbackRequest := &capturedRequest{}
+		fallbackServer := chatCompletionServer(t, http.StatusOK, `{"answer":"done"}`, fallbackRequest, nil)
+		t.Cleanup(fallbackServer.Close)
+		primary := llm.NewClient("primary", llm.WithBaseURL(primaryServer.URL))
+		fallback := llm.NewClient("fallback", llm.WithBaseURL(fallbackServer.URL))
+		breaker := llm.NewCircuitBreaker(primary, fallback)
+
+		_, err := breaker.Complete(t.Context(), llm.ChatRequest{
+			StructuredOutput: &llm.StructuredOutput{
+				Name:   "answer",
+				Schema: json.RawMessage(`{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"]}`),
+				Strict: true,
+			},
+		})
+
+		require.NoError(t, err)
+		responseFormat := fallbackRequest.JSONBody["response_format"].(map[string]any)
+		require.Equal(t, "json_schema", responseFormat["type"])
+		jsonSchema := responseFormat["json_schema"].(map[string]any)
+		require.Equal(t, "answer", jsonSchema["name"])
+		require.Equal(t, true, jsonSchema["strict"])
+	})
+
+	for _, status := range []int{http.StatusBadRequest, http.StatusPreconditionFailed, http.StatusUnprocessableEntity, http.StatusConflict} {
+		t.Run(http.StatusText(status)+" falls back without opening circuit", func(t *testing.T) {
+			var primaryHits atomic.Int32
+			primaryServer := chatCompletionServer(t, status, "", nil, &primaryHits)
+			t.Cleanup(primaryServer.Close)
+			fallbackServer := chatCompletionServer(t, http.StatusOK, "fallback", nil, nil)
+			t.Cleanup(fallbackServer.Close)
+			primary := llm.NewClient("primary", llm.WithBaseURL(primaryServer.URL))
+			fallback := llm.NewClient("fallback", llm.WithBaseURL(fallbackServer.URL))
+			breaker := llm.NewCircuitBreakerWithConfig(llm.BreakerConfig{FailureThreshold: 1}, primary, fallback)
+
+			for range 2 {
+				_, err := breaker.Complete(t.Context(), llm.ChatRequest{})
+				require.NoError(t, err)
+			}
+
+			require.Equal(t, int32(2), primaryHits.Load())
+		})
+	}
+
+	for _, status := range []int{
+		http.StatusUnauthorized,
+		http.StatusForbidden,
+		http.StatusNotFound,
+		http.StatusRequestTimeout,
+		http.StatusRequestEntityTooLarge,
+		http.StatusTooManyRequests,
+		http.StatusInternalServerError,
+	} {
+		t.Run(http.StatusText(status)+" falls back and opens circuit", func(t *testing.T) {
+			var primaryHits atomic.Int32
+			primaryServer := chatCompletionServer(t, status, "", nil, &primaryHits)
+			t.Cleanup(primaryServer.Close)
+			fallbackServer := chatCompletionServer(t, http.StatusOK, "fallback", nil, nil)
+			t.Cleanup(fallbackServer.Close)
+			primary := llm.NewClient("primary", llm.WithBaseURL(primaryServer.URL))
+			fallback := llm.NewClient("fallback", llm.WithBaseURL(fallbackServer.URL))
+			breaker := llm.NewCircuitBreakerWithConfig(llm.BreakerConfig{FailureThreshold: 1}, primary, fallback)
+
+			for range 2 {
+				_, err := breaker.Complete(t.Context(), llm.ChatRequest{})
+				require.NoError(t, err)
+			}
+
+			require.Equal(t, int32(1), primaryHits.Load())
+		})
+	}
+
+	t.Run("failover events identify each failed provider", func(t *testing.T) {
+		primaryServer := chatCompletionServer(t, http.StatusBadRequest, "", nil, nil)
+		t.Cleanup(primaryServer.Close)
+		firstFallbackServer := chatCompletionServer(t, http.StatusInternalServerError, "", nil, nil)
+		t.Cleanup(firstFallbackServer.Close)
+		finalServer := chatCompletionServer(t, http.StatusOK, "final", nil, nil)
+		t.Cleanup(finalServer.Close)
+		primary := llm.NewClient("shared", llm.WithProviderID("primary"), llm.WithBaseURL(primaryServer.URL))
+		firstFallback := llm.NewClient("shared", llm.WithProviderID("fallback-1"), llm.WithBaseURL(firstFallbackServer.URL))
+		final := llm.NewClient("shared", llm.WithProviderID("fallback-2"), llm.WithBaseURL(finalServer.URL))
+		events := make(chan llm.FailoverEvent, 2)
+		breaker := llm.NewCircuitBreakerWithConfig(llm.BreakerConfig{
+			FailureThreshold: 1,
+			OnFailover: func(_ context.Context, event llm.FailoverEvent) {
+				events <- event
+			},
+		}, primary, firstFallback, final)
+
+		resp, err := breaker.Complete(t.Context(), llm.ChatRequest{})
+
+		require.NoError(t, err)
+		require.Equal(t, "final", resp.Choices[0].Message.Content)
+		require.Len(t, events, 2)
+		first := <-events
+		require.Equal(t, "primary", first.FromProvider)
+		require.Equal(t, 0, first.FromProviderIndex)
+		require.Equal(t, "fallback-1", first.ToProvider)
+		require.False(t, first.CountedAgainstBreaker)
+		var statusErr *llm.StatusError
+		require.ErrorAs(t, first.Error, &statusErr)
+		require.Equal(t, http.StatusBadRequest, statusErr.StatusCode)
+		second := <-events
+		require.Equal(t, "fallback-1", second.FromProvider)
+		require.Equal(t, 1, second.FromProviderIndex)
+		require.Equal(t, "fallback-2", second.ToProvider)
+		require.False(t, second.CountedAgainstBreaker)
+	})
+
+	t.Run("counted primary error emits failover only for error transition", func(t *testing.T) {
+		primaryServer := chatCompletionServer(t, http.StatusInternalServerError, "", nil, nil)
+		t.Cleanup(primaryServer.Close)
+		fallbackServer := chatCompletionServer(t, http.StatusOK, "fallback", nil, nil)
+		t.Cleanup(fallbackServer.Close)
+		primary := llm.NewClient("shared", llm.WithProviderID("primary"), llm.WithBaseURL(primaryServer.URL))
+		fallback := llm.NewClient("shared", llm.WithProviderID("fallback"), llm.WithBaseURL(fallbackServer.URL))
+		events := make(chan llm.FailoverEvent, 2)
+		breaker := llm.NewCircuitBreakerWithConfig(llm.BreakerConfig{
+			FailureThreshold: 1,
+			OnFailover: func(_ context.Context, event llm.FailoverEvent) {
+				events <- event
+			},
+		}, primary, fallback)
+
+		for range 2 {
+			_, err := breaker.Complete(t.Context(), llm.ChatRequest{})
+			require.NoError(t, err)
+		}
+
+		require.Len(t, events, 1)
+		event := <-events
+		require.True(t, event.CountedAgainstBreaker)
+		require.Equal(t, "primary", event.FromProvider)
+		require.Equal(t, "fallback", event.ToProvider)
+	})
+
+	t.Run("trigger failure falls back", func(t *testing.T) {
 		primaryServer := chatCompletionServer(t, http.StatusServiceUnavailable, "", nil, nil)
 		t.Cleanup(primaryServer.Close)
 
@@ -56,8 +231,9 @@ func TestCircuitBreaker_Complete(t *testing.T) {
 		require.Equal(t, int32(1), primaryHits.Load())
 	})
 
-	t.Run("non-trigger primary error does not fall back", func(t *testing.T) {
-		primaryServer := chatCompletionServer(t, http.StatusBadRequest, "", nil, nil)
+	t.Run("forbidden primary falls back and opens circuit", func(t *testing.T) {
+		var primaryHits atomic.Int32
+		primaryServer := chatCompletionServer(t, http.StatusForbidden, "", nil, &primaryHits)
 		t.Cleanup(primaryServer.Close)
 
 		var fallbackHits atomic.Int32
@@ -68,95 +244,249 @@ func TestCircuitBreaker_Complete(t *testing.T) {
 		fallback := llm.NewClient("fallback", llm.WithBaseURL(fallbackServer.URL))
 		breaker := llm.NewCircuitBreaker(primary, fallback)
 
-		_, err := breaker.Complete(t.Context(), llm.ChatRequest{Messages: []llm.ChatMessage{{Role: "user", Content: "hello"}}})
+		for range 4 {
+			resp, err := breaker.Complete(t.Context(), llm.ChatRequest{Messages: []llm.ChatMessage{{Role: "user", Content: "hello"}}})
+			require.NoError(t, err)
+			require.Equal(t, `{"fallback":true}`, resp.Choices[0].Message.Content)
+		}
+		require.Equal(t, int32(3), primaryHits.Load())
+		require.Equal(t, int32(4), fallbackHits.Load())
+	})
 
-		require.EqualError(t, err, "chat completions returned status 400")
+	t.Run("provider deadline falls back while caller context is active", func(t *testing.T) {
+		primary := llm.NewClient("primary", llm.WithHTTPClient(&http.Client{
+			Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+				return nil, context.DeadlineExceeded
+			}),
+		}))
+		fallbackServer := chatCompletionServer(t, http.StatusOK, "fallback", nil, nil)
+		t.Cleanup(fallbackServer.Close)
+		fallback := llm.NewClient("fallback", llm.WithBaseURL(fallbackServer.URL))
+		breaker := llm.NewCircuitBreaker(primary, fallback)
+
+		resp, err := breaker.Complete(t.Context(), llm.ChatRequest{Messages: []llm.ChatMessage{{Role: "user", Content: "hello"}}})
+
+		require.NoError(t, err)
+		require.Equal(t, "fallback", resp.Choices[0].Message.Content)
+	})
+
+	t.Run("caller cancellation does not fall back", func(t *testing.T) {
+		var primaryHits atomic.Int32
+		primaryServer := chatCompletionServer(t, http.StatusOK, "primary", nil, &primaryHits)
+		t.Cleanup(primaryServer.Close)
+		var fallbackHits atomic.Int32
+		fallbackServer := chatCompletionServer(t, http.StatusOK, "fallback", nil, &fallbackHits)
+		t.Cleanup(fallbackServer.Close)
+		primary := llm.NewClient("primary", llm.WithBaseURL(primaryServer.URL))
+		fallback := llm.NewClient("fallback", llm.WithBaseURL(fallbackServer.URL))
+		breaker := llm.NewCircuitBreaker(primary, fallback)
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+
+		_, err := breaker.Complete(ctx, llm.ChatRequest{Messages: []llm.ChatMessage{{Role: "user", Content: "hello"}}})
+
+		require.ErrorIs(t, err, context.Canceled)
+		require.Equal(t, int32(0), primaryHits.Load())
 		require.Equal(t, int32(0), fallbackHits.Load())
 	})
 
-	t.Run("circuit opens after threshold and skips primary until probe succeeds", func(t *testing.T) {
-		clock := &fakeClock{now: time.Unix(1000, 0)}
-		var primaryHits atomic.Int32
-		var primaryHealthy atomic.Bool
-		primaryServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			primaryHits.Add(1)
-			if err := captureJSONRequest(r, nil); err != nil {
-				http.Error(w, err.Error(), http.StatusBadRequest)
-				return
-			}
-			if !primaryHealthy.Load() {
-				w.WriteHeader(http.StatusServiceUnavailable)
-				return
-			}
-			writeChatCompletion(w, `{"primary":true}`)
-		}))
-		t.Cleanup(primaryServer.Close)
-
-		fallbackServer := chatCompletionServer(t, http.StatusOK, `{"fallback":true}`, nil, nil)
+	t.Run("caller cancellation during primary does not fall back", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		primary := llm.NewClient("primary", llm.WithHTTPClient(&http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			cancel()
+			return nil, context.Canceled
+		})}))
+		var fallbackHits atomic.Int32
+		fallbackServer := chatCompletionServer(t, http.StatusOK, "fallback", nil, &fallbackHits)
 		t.Cleanup(fallbackServer.Close)
-
-		primary := llm.NewClient("primary", llm.WithBaseURL(primaryServer.URL))
 		fallback := llm.NewClient("fallback", llm.WithBaseURL(fallbackServer.URL))
-		breaker := llm.NewCircuitBreakerWithConfig(llm.BreakerConfig{
-			FailureThreshold:         2,
-			OpenDuration:             time.Minute,
-			ProbeInterval:            10 * time.Second,
-			SuccessfulProbeThreshold: 1,
-			Now:                      clock.Now,
-		}, primary, fallback)
+		breaker := llm.NewCircuitBreaker(primary, fallback)
 
-		for range 2 {
+		_, err := breaker.Complete(ctx, llm.ChatRequest{})
+
+		require.ErrorIs(t, err, context.Canceled)
+		require.Equal(t, int32(0), fallbackHits.Load())
+	})
+
+	t.Run("client timeout falls back with a fresh timeout", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			primary := llm.NewClient("primary",
+				llm.WithRequestTimeout(time.Second),
+				llm.WithHTTPClient(&http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+					<-req.Context().Done()
+					return nil, req.Context().Err()
+				})}),
+			)
+			fallback := llm.NewClient("fallback",
+				llm.WithRequestTimeout(2*time.Second),
+				llm.WithHTTPClient(&http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+					deadline, ok := req.Context().Deadline()
+					require.True(t, ok)
+					require.Equal(t, 2*time.Second, time.Until(deadline))
+					return &http.Response{
+						StatusCode: http.StatusOK,
+						Header:     make(http.Header),
+						Body:       io.NopCloser(strings.NewReader(chatCompletionJSON("fallback"))),
+					}, nil
+				})}),
+			)
+			breaker := llm.NewCircuitBreaker(primary, fallback)
+
+			resp, err := breaker.Complete(t.Context(), llm.ChatRequest{Messages: []llm.ChatMessage{{Role: "user", Content: "hello"}}})
+
+			require.NoError(t, err)
+			require.Equal(t, "fallback", resp.Choices[0].Message.Content)
+		})
+	})
+
+	t.Run("circuit opens after threshold and skips primary until probe succeeds", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			var primaryHits atomic.Int32
+			var primaryHealthy atomic.Bool
+			primary := llm.NewClient("primary", llm.WithHTTPClient(&http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+				primaryHits.Add(1)
+				if !primaryHealthy.Load() {
+					return testHTTPResponse(http.StatusServiceUnavailable, ""), nil
+				}
+				return testHTTPResponse(http.StatusOK, `{"primary":true}`), nil
+			})}))
+			fallback := llm.NewClient("fallback", llm.WithHTTPClient(&http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+				return testHTTPResponse(http.StatusOK, `{"fallback":true}`), nil
+			})}))
+			breaker := llm.NewCircuitBreakerWithConfig(llm.BreakerConfig{
+				FailureThreshold:         2,
+				OpenDuration:             time.Minute,
+				ProbeInterval:            10 * time.Second,
+				SuccessfulProbeThreshold: 1,
+			}, primary, fallback)
+
+			for range 2 {
+				_, err := breaker.Complete(t.Context(), llm.ChatRequest{Messages: []llm.ChatMessage{{Role: "user", Content: "hello"}}})
+				require.NoError(t, err)
+			}
+
+			primaryBefore := primaryHits.Load()
 			_, err := breaker.Complete(t.Context(), llm.ChatRequest{Messages: []llm.ChatMessage{{Role: "user", Content: "hello"}}})
 			require.NoError(t, err)
-		}
+			require.Equal(t, primaryBefore, primaryHits.Load())
 
-		primaryBefore := primaryHits.Load()
-		_, err := breaker.Complete(t.Context(), llm.ChatRequest{Messages: []llm.ChatMessage{{Role: "user", Content: "hello"}}})
-		require.NoError(t, err)
-		require.Equal(t, primaryBefore, primaryHits.Load())
+			primaryHealthy.Store(true)
+			time.Sleep(time.Minute)
+			_, err = breaker.Complete(t.Context(), llm.ChatRequest{Messages: []llm.ChatMessage{{Role: "user", Content: "hello"}}})
+			require.NoError(t, err)
+			require.Equal(t, primaryBefore+1, primaryHits.Load())
 
-		primaryHealthy.Store(true)
-		clock.Advance(time.Minute)
-		_, err = breaker.Complete(t.Context(), llm.ChatRequest{Messages: []llm.ChatMessage{{Role: "user", Content: "hello"}}})
-		require.NoError(t, err)
-		require.Equal(t, primaryBefore+1, primaryHits.Load())
-
-		_, err = breaker.Complete(t.Context(), llm.ChatRequest{Messages: []llm.ChatMessage{{Role: "user", Content: "hello"}}})
-		require.NoError(t, err)
-		require.Equal(t, primaryBefore+2, primaryHits.Load())
+			_, err = breaker.Complete(t.Context(), llm.ChatRequest{Messages: []llm.ChatMessage{{Role: "user", Content: "hello"}}})
+			require.NoError(t, err)
+			require.Equal(t, primaryBefore+2, primaryHits.Load())
+		})
 	})
 
 	t.Run("failed probe reopens circuit and skips primary again", func(t *testing.T) {
-		clock := &fakeClock{now: time.Unix(2000, 0)}
-		var primaryHits atomic.Int32
-		primaryServer := chatCompletionServer(t, http.StatusServiceUnavailable, "", nil, &primaryHits)
-		t.Cleanup(primaryServer.Close)
+		synctest.Test(t, func(t *testing.T) {
+			var primaryHits atomic.Int32
+			var primaryStatus atomic.Int32
+			primaryStatus.Store(http.StatusServiceUnavailable)
+			primary := llm.NewClient("primary", llm.WithHTTPClient(&http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+				primaryHits.Add(1)
+				return testHTTPResponse(int(primaryStatus.Load()), ""), nil
+			})}))
+			fallback := llm.NewClient("fallback", llm.WithHTTPClient(&http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+				return testHTTPResponse(http.StatusOK, `{"fallback":true}`), nil
+			})}))
+			breaker := llm.NewCircuitBreakerWithConfig(llm.BreakerConfig{
+				FailureThreshold:         1,
+				OpenDuration:             time.Minute,
+				SuccessfulProbeThreshold: 1,
+			}, primary, fallback)
 
-		fallbackServer := chatCompletionServer(t, http.StatusOK, `{"fallback":true}`, nil, nil)
-		t.Cleanup(fallbackServer.Close)
+			_, err := breaker.Complete(t.Context(), llm.ChatRequest{Messages: []llm.ChatMessage{{Role: "user", Content: "hello"}}})
+			require.NoError(t, err)
+			primaryBeforeProbe := primaryHits.Load()
 
-		primary := llm.NewClient("primary", llm.WithBaseURL(primaryServer.URL))
-		fallback := llm.NewClient("fallback", llm.WithBaseURL(fallbackServer.URL))
-		breaker := llm.NewCircuitBreakerWithConfig(llm.BreakerConfig{
-			FailureThreshold:         1,
-			OpenDuration:             time.Minute,
-			SuccessfulProbeThreshold: 1,
-			Now:                      clock.Now,
-		}, primary, fallback)
+			primaryStatus.Store(http.StatusForbidden)
+			time.Sleep(time.Minute)
+			_, err = breaker.Complete(t.Context(), llm.ChatRequest{Messages: []llm.ChatMessage{{Role: "user", Content: "hello"}}})
+			require.NoError(t, err)
+			require.Equal(t, primaryBeforeProbe+1, primaryHits.Load())
 
-		_, err := breaker.Complete(t.Context(), llm.ChatRequest{Messages: []llm.ChatMessage{{Role: "user", Content: "hello"}}})
-		require.NoError(t, err)
-		primaryBeforeProbe := primaryHits.Load()
+			primaryAfterProbe := primaryHits.Load()
+			_, err = breaker.Complete(t.Context(), llm.ChatRequest{Messages: []llm.ChatMessage{{Role: "user", Content: "hello"}}})
+			require.NoError(t, err)
+			require.Equal(t, primaryAfterProbe, primaryHits.Load())
+		})
+	})
 
-		clock.Advance(time.Minute)
-		_, err = breaker.Complete(t.Context(), llm.ChatRequest{Messages: []llm.ChatMessage{{Role: "user", Content: "hello"}}})
-		require.NoError(t, err)
-		require.Equal(t, primaryBeforeProbe+1, primaryHits.Load())
+	t.Run("neutral probe schedules another probe without reopening", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			var primaryStatus atomic.Int32
+			primaryStatus.Store(http.StatusForbidden)
+			primary := llm.NewClient("primary", llm.WithHTTPClient(&http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+				return testHTTPResponse(int(primaryStatus.Load()), "primary"), nil
+			})}))
+			fallback := llm.NewClient("fallback", llm.WithHTTPClient(&http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+				return testHTTPResponse(http.StatusOK, "fallback"), nil
+			})}))
+			breaker := llm.NewCircuitBreakerWithConfig(llm.BreakerConfig{
+				FailureThreshold: 1,
+				OpenDuration:     time.Minute,
+				ProbeInterval:    10 * time.Second,
+			}, primary, fallback)
 
-		primaryAfterProbe := primaryHits.Load()
-		_, err = breaker.Complete(t.Context(), llm.ChatRequest{Messages: []llm.ChatMessage{{Role: "user", Content: "hello"}}})
-		require.NoError(t, err)
-		require.Equal(t, primaryAfterProbe, primaryHits.Load())
+			_, err := breaker.Complete(t.Context(), llm.ChatRequest{})
+			require.NoError(t, err)
+
+			primaryStatus.Store(http.StatusBadRequest)
+			time.Sleep(time.Minute)
+			_, err = breaker.Complete(t.Context(), llm.ChatRequest{})
+			require.NoError(t, err)
+
+			primaryStatus.Store(http.StatusOK)
+			time.Sleep(10 * time.Second)
+			resp, err := breaker.Complete(t.Context(), llm.ChatRequest{})
+			require.NoError(t, err)
+			require.Equal(t, "primary", resp.Choices[0].Message.Content)
+		})
+	})
+
+	t.Run("caller cancellation releases recovery probe", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			var mode atomic.Int32
+			cancelProbe := func() {}
+			primary := llm.NewClient("primary", llm.WithHTTPClient(&http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+				switch mode.Load() {
+				case 0:
+					return testHTTPResponse(http.StatusForbidden, ""), nil
+				case 1:
+					cancelProbe()
+					return nil, context.Canceled
+				default:
+					return testHTTPResponse(http.StatusOK, "primary"), nil
+				}
+			})}))
+			fallback := llm.NewClient("fallback", llm.WithHTTPClient(&http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+				return testHTTPResponse(http.StatusOK, "fallback"), nil
+			})}))
+			breaker := llm.NewCircuitBreakerWithConfig(llm.BreakerConfig{
+				FailureThreshold: 1,
+				OpenDuration:     time.Minute,
+			}, primary, fallback)
+
+			_, err := breaker.Complete(t.Context(), llm.ChatRequest{})
+			require.NoError(t, err)
+			time.Sleep(time.Minute)
+
+			mode.Store(1)
+			probeCtx, cancel := context.WithCancel(t.Context())
+			cancelProbe = cancel
+			_, err = breaker.Complete(probeCtx, llm.ChatRequest{})
+			require.ErrorIs(t, err, context.Canceled)
+
+			mode.Store(2)
+			resp, err := breaker.Complete(t.Context(), llm.ChatRequest{})
+			require.NoError(t, err)
+			require.Equal(t, "primary", resp.Choices[0].Message.Content)
+		})
 	})
 
 	t.Run("pass through without fallbacks", func(t *testing.T) {
@@ -175,14 +505,14 @@ func TestCircuitBreaker_Complete(t *testing.T) {
 	})
 }
 
-type fakeClock struct {
-	now time.Time
-}
-
-func (c *fakeClock) Now() time.Time {
-	return c.now
-}
-
-func (c *fakeClock) Advance(d time.Duration) {
-	c.now = c.now.Add(d)
+func testHTTPResponse(status int, content string) *http.Response {
+	body := content
+	if status < http.StatusBadRequest {
+		body = chatCompletionJSON(content)
+	}
+	return &http.Response{
+		StatusCode: status,
+		Header:     make(http.Header),
+		Body:       io.NopCloser(strings.NewReader(body)),
+	}
 }
