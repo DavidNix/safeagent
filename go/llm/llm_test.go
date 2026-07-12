@@ -48,6 +48,17 @@ func TestClient_Complete(t *testing.T) {
 		runLLMReasoningE2ECompletion(t, ctx, client, "SAFEAGENT_LLM_OPENROUTER_REASONING_E2E")
 	})
 
+	t.Run("e2e openrouter structured output", func(t *testing.T) {
+		skipE2EInShortMode(t)
+		apiKey := requireE2EEnv(t, openRouterAPIKeyEnv)
+		ctx, cancel := e2eContext(t)
+		defer cancel()
+
+		client := newOpenRouterE2EClient(apiKey, "")
+
+		runLLMStructuredOutputE2E(t, ctx, client, "SAFEAGENT_LLM_OPENROUTER_STRUCTURED_E2E")
+	})
+
 	t.Run("e2e vllm client", func(t *testing.T) {
 		skipE2EInShortMode(t)
 		baseURL := requireE2EEnv(t, vllmBaseURLEnv)
@@ -68,6 +79,17 @@ func TestClient_Complete(t *testing.T) {
 		client := newVLLMReasoningE2EClient(t, ctx, baseURL)
 
 		runLLMReasoningE2ECompletion(t, ctx, client, "SAFEAGENT_LLM_VLLM_REASONING_E2E")
+	})
+
+	t.Run("e2e vllm structured output", func(t *testing.T) {
+		skipE2EInShortMode(t)
+		baseURL := requireE2EEnv(t, vllmBaseURLEnv)
+		ctx, cancel := e2eContext(t)
+		defer cancel()
+
+		client := newVLLME2EClient(t, ctx, baseURL)
+
+		runLLMStructuredOutputE2E(t, ctx, client, "SAFEAGENT_LLM_VLLM_STRUCTURED_E2E")
 	})
 
 	t.Run("happy path sends chat completion request and decodes api response", func(t *testing.T) {
@@ -140,6 +162,56 @@ func TestClient_Complete(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, "hidden chain", resp.Choices[0].Message.ReasoningContent)
 		require.Equal(t, "final", resp.Choices[0].Message.Content)
+	})
+
+	t.Run("structured output serializes json schema and overrides extra fields", func(t *testing.T) {
+		request := &capturedRequest{}
+		server := chatCompletionServer(t, http.StatusOK, `{"answer":"done"}`, request, nil)
+		t.Cleanup(server.Close)
+		client := llm.NewClient("gpt-test",
+			llm.WithBaseURL(server.URL),
+			llm.WithExtraFields(map[string]any{
+				"response_format": map[string]any{"type": "conflicting"},
+			}),
+		)
+		schema := json.RawMessage(`{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"],"additionalProperties":false}`)
+
+		_, err := client.Complete(t.Context(), llm.ChatRequest{
+			Messages: []llm.ChatMessage{{Role: "user", Content: "answer"}},
+			StructuredOutput: &llm.StructuredOutput{
+				Name:        "answer",
+				Description: "A concise answer",
+				Schema:      schema,
+				Strict:      true,
+			},
+		})
+
+		require.NoError(t, err)
+		responseFormat, err := json.Marshal(request.JSONBody["response_format"])
+		require.NoError(t, err)
+		require.JSONEq(t, `{
+			"type":"json_schema",
+			"json_schema":{
+				"name":"answer",
+				"description":"A concise answer",
+				"schema":{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"],"additionalProperties":false},
+				"strict":true
+			}
+		}`, string(responseFormat))
+	})
+
+	t.Run("invalid structured output schema fails before provider request", func(t *testing.T) {
+		var hits atomic.Int32
+		server := chatCompletionServer(t, http.StatusOK, "unused", nil, &hits)
+		t.Cleanup(server.Close)
+		client := llm.NewClient("gpt-test", llm.WithBaseURL(server.URL))
+
+		_, err := client.Complete(t.Context(), llm.ChatRequest{
+			StructuredOutput: &llm.StructuredOutput{Name: "invalid", Schema: json.RawMessage(`{`)},
+		})
+
+		require.EqualError(t, err, "marshal chat completions request: json: error calling MarshalJSON for type json.RawMessage: unexpected end of JSON input")
+		require.Equal(t, int32(0), hits.Load())
 	})
 
 	t.Run("provider constructors apply openrouter and vllm configuration", func(t *testing.T) {

@@ -219,13 +219,34 @@ func NewOpenRouter(cfg OpenRouterConfig) *Client {
 // ChatRequest is an OpenAI-compatible Chat Completions request without the
 // model field. Client injects its configured model into each request.
 type ChatRequest struct {
-	Messages          []ChatMessage `json:"messages"`
-	Tools             []ChatTool    `json:"tools,omitempty"`
-	Temperature       *float64      `json:"temperature,omitempty"`
-	TopP              *float64      `json:"top_p,omitempty"`
-	MaxTokens         *int          `json:"max_completion_tokens,omitempty"`
-	ParallelToolCalls *bool         `json:"parallel_tool_calls,omitempty"`
-	ToolChoice        any           `json:"tool_choice,omitempty"`
+	Messages          []ChatMessage     `json:"messages"`
+	Tools             []ChatTool        `json:"tools,omitempty"`
+	Temperature       *float64          `json:"temperature,omitempty"`
+	TopP              *float64          `json:"top_p,omitempty"`
+	MaxTokens         *int              `json:"max_completion_tokens,omitempty"`
+	ParallelToolCalls *bool             `json:"parallel_tool_calls,omitempty"`
+	ToolChoice        any               `json:"tool_choice,omitempty"`
+	StructuredOutput  *StructuredOutput `json:"-"`
+}
+
+// StructuredOutput constrains a chat completion to a JSON Schema. Providers
+// must support OpenAI-compatible strict structured outputs.
+//
+// Example:
+//
+//	request := llm.ChatRequest{
+//		Messages: []llm.ChatMessage{{Role: "user", Content: "Give me an answer."}},
+//		StructuredOutput: &llm.StructuredOutput{
+//			Name:   "answer",
+//			Schema: json.RawMessage(`{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"],"additionalProperties":false}`),
+//			Strict: true,
+//		},
+//	}
+type StructuredOutput struct {
+	Name        string          `json:"name"`
+	Description string          `json:"description,omitempty"`
+	Schema      json.RawMessage `json:"schema"`
+	Strict      bool            `json:"strict,omitempty"`
 }
 
 // ChatFunctionCall is a tool/function call payload in a chat message.
@@ -367,8 +388,14 @@ func (e *ResponseTooLargeError) Error() string {
 }
 
 type wireChatRequest struct {
-	Model string `json:"model"`
+	Model          string              `json:"model"`
+	ResponseFormat *wireResponseFormat `json:"response_format,omitempty"`
 	ChatRequest
+}
+
+type wireResponseFormat struct {
+	Type       string            `json:"type"`
+	JSONSchema *StructuredOutput `json:"json_schema"`
 }
 
 type requestSerializationError struct {
@@ -453,7 +480,11 @@ func (c *Client) Models(ctx context.Context) (*ModelsResponse, error) {
 }
 
 func (c *Client) marshalRequest(req ChatRequest) ([]byte, error) {
-	body, err := json.Marshal(wireChatRequest{Model: c.model, ChatRequest: req})
+	wireReq := wireChatRequest{Model: c.model, ChatRequest: req}
+	if req.StructuredOutput != nil {
+		wireReq.ResponseFormat = &wireResponseFormat{Type: "json_schema", JSONSchema: req.StructuredOutput}
+	}
+	body, err := json.Marshal(wireReq)
 	if err != nil {
 		return nil, err
 	}
@@ -464,7 +495,11 @@ func (c *Client) marshalRequest(req ChatRequest) ([]byte, error) {
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return nil, err
 	}
+	responseFormat := payload["response_format"]
 	applyExtraFields(payload, c.extraFields)
+	if responseFormat != nil {
+		payload["response_format"] = responseFormat
+	}
 	return json.Marshal(payload)
 }
 

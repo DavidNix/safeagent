@@ -214,7 +214,41 @@ ag.InstructionsFunc = func(ctx context.Context, rc *agent.RunContext, a *agent.A
 
 `ModelSettings` tunes generation per agent: `Temperature`, `TopP`,
 `MaxTokens`, `ParallelToolCalls` (nil pointers are omitted from the request),
-and `ToolChoice` (`"auto"`, `"required"`, `"none"`, or a tool name to force).
+`ToolChoice` (`"auto"`, `"required"`, `"none"`, or a tool name to force), and
+`StructuredOutput`.
+
+`StructuredOutput` requests modern JSON Schema structured output. The client
+does not expose the legacy `json_object` mode and does not validate the model's
+response locally; `RunResult.FinalOutput` remains a JSON string. Provider and
+model support varies.
+
+```go
+schema := json.RawMessage(`{
+  "type": "object",
+  "properties": {
+    "answer": {"type": "string"}
+  },
+  "required": ["answer"],
+  "additionalProperties": false
+}`)
+
+assistant := &agent.Agent{
+  Name:  "Structured assistant",
+  Model: model,
+  ModelSettings: agent.ModelSettings{
+    StructuredOutput: &llm.StructuredOutput{
+      Name:        "answer",
+      Description: "A concise answer",
+      Schema:      schema,
+      Strict:      true,
+    },
+  },
+}
+```
+
+The same type can be set directly on `llm.ChatRequest.StructuredOutput`. An
+explicit structured output takes precedence over a conflicting static
+`response_format` in `WithExtraFields`.
 
 A forced `ToolChoice` is a one-shot constraint: once an agent has executed
 tool calls in a run, any `ToolChoice` other than `"none"` is dropped from

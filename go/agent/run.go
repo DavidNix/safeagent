@@ -142,6 +142,7 @@ func buildChatRequest(instructions string, input []Item, settings ModelSettings,
 		MaxTokens:         settings.MaxTokens,
 		ParallelToolCalls: settings.ParallelToolCalls,
 		ToolChoice:        toolChoiceValue(settings.ToolChoice),
+		StructuredOutput:  settings.StructuredOutput,
 	}
 }
 

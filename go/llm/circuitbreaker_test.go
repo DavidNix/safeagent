@@ -2,6 +2,7 @@ package llm_test
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -47,6 +48,32 @@ func TestCircuitBreaker_Complete(t *testing.T) {
 
 		require.EqualError(t, err, "marshal chat completions request: json: unsupported type: func()")
 		require.Equal(t, int32(0), finalHits.Load())
+	})
+
+	t.Run("structured output is preserved during fallback", func(t *testing.T) {
+		primaryServer := chatCompletionServer(t, http.StatusInternalServerError, "", nil, nil)
+		t.Cleanup(primaryServer.Close)
+		fallbackRequest := &capturedRequest{}
+		fallbackServer := chatCompletionServer(t, http.StatusOK, `{"answer":"done"}`, fallbackRequest, nil)
+		t.Cleanup(fallbackServer.Close)
+		primary := llm.NewClient("primary", llm.WithBaseURL(primaryServer.URL))
+		fallback := llm.NewClient("fallback", llm.WithBaseURL(fallbackServer.URL))
+		breaker := llm.NewCircuitBreaker(primary, fallback)
+
+		_, err := breaker.Complete(t.Context(), llm.ChatRequest{
+			StructuredOutput: &llm.StructuredOutput{
+				Name:   "answer",
+				Schema: json.RawMessage(`{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"]}`),
+				Strict: true,
+			},
+		})
+
+		require.NoError(t, err)
+		responseFormat := fallbackRequest.JSONBody["response_format"].(map[string]any)
+		require.Equal(t, "json_schema", responseFormat["type"])
+		jsonSchema := responseFormat["json_schema"].(map[string]any)
+		require.Equal(t, "answer", jsonSchema["name"])
+		require.Equal(t, true, jsonSchema["strict"])
 	})
 
 	for _, status := range []int{http.StatusBadRequest, http.StatusPreconditionFailed, http.StatusUnprocessableEntity, http.StatusConflict} {

@@ -3,6 +3,7 @@ package agent_test
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -69,6 +70,7 @@ func captureModelRequest(req llm.ChatRequest) capturedModelRequest {
 			MaxTokens:         req.MaxTokens,
 			ParallelToolCalls: req.ParallelToolCalls,
 			ToolChoice:        toolChoiceString(req.ToolChoice),
+			StructuredOutput:  req.StructuredOutput,
 		},
 	}
 	toolNamesByCallID := map[string]string{}
@@ -526,6 +528,27 @@ func TestRunner_Run(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, "required", model.requests[0].ModelSettings.ToolChoice)
 		require.Equal(t, "", model.requests[1].ModelSettings.ToolChoice)
+	})
+
+	t.Run("structured output propagates from model settings", func(t *testing.T) {
+		output := &llm.StructuredOutput{
+			Name:   "answer",
+			Schema: json.RawMessage(`{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"]}`),
+			Strict: true,
+		}
+		model := &fakeModel{responses: []fakeModelResponse{{Output: []agent.Item{agent.AssistantMessage(`{"answer":"done"}`)}}}}
+		ag := &agent.Agent{
+			Name:          "assistant",
+			Model:         model,
+			ModelSettings: agent.ModelSettings{StructuredOutput: output},
+		}
+
+		result, err := agent.Run(t.Context(), ag, "go")
+
+		require.NoError(t, err)
+		require.Equal(t, `{"answer":"done"}`, result.FinalOutput)
+		require.Equal(t, output, model.rawRequests[0].StructuredOutput)
+		require.Equal(t, output, model.requests[0].ModelSettings.StructuredOutput)
 	})
 
 	t.Run("tool choice reset disabled", func(t *testing.T) {
