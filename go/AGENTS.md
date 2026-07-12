@@ -36,6 +36,7 @@ make test  # run all tests
 - Log messages: proper casing, no interpolation. Use structured fields for dynamic values, for example `slog.Error("Failed to capture pageview", "error", err)` instead of `slog.Error(fmt.Sprintf("failed: %v", err))`.
 - Public methods and functions should never accept private types or interfaces.
 - Go 1.26+ allows `new(<literal>)` to get a pointer from a literal, for example `new(42)`.
+- Use `cmp.Or(value, fallback)` for zero-value fallback selection instead of assigning and then checking the value with an `if`.
 - Nest the error path, not the happy path. Avoid `err == nil`; prefer `err != nil`.
 
 ## Test Standards
