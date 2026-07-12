@@ -31,7 +31,8 @@ func NewEmbeddingCircuitBreakerWithConfig(cfg BreakerConfig, primary *EmbeddingC
 
 // Embed creates embeddings using the primary client and optional fallbacks.
 func (b *EmbeddingCircuitBreaker) Embed(ctx context.Context, req EmbeddingRequest) (*EmbeddingResponse, error) {
-	if err := ctx.Err(); err != nil {
+	body, err := b.primary.prepareEmbeddingRequest(ctx, req)
+	if err != nil {
 		return nil, err
 	}
 	decision := b.breaker.decide()
@@ -39,15 +40,24 @@ func (b *EmbeddingCircuitBreaker) Embed(ctx context.Context, req EmbeddingReques
 		return b.fallback(ctx, req, nil)
 	}
 
-	resp, err := b.primary.Embed(ctx, req)
+	resp, err := b.primary.embed(ctx, body, req)
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			b.breaker.releaseProbe(decision.wasProbe)
+			return nil, ctxErr
+		}
+		disposition := classifyProviderError(err)
+		if !disposition.fallback {
+			return nil, err
+		}
+		b.breaker.recordResult(decision.wasProbe, disposition.counted)
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return nil, ctxErr
 		}
-		b.breaker.recordFailure(ctx, err, decision.wasProbe)
 		if len(b.fallbacks) == 0 {
 			return nil, err
 		}
+		b.breaker.notifyFailover(ctx, b.primary.client.providerID, 0, b.fallbacks[0].client.providerID, err, disposition.counted)
 		return b.fallback(ctx, req, []error{err})
 	}
 
@@ -56,13 +66,23 @@ func (b *EmbeddingCircuitBreaker) Embed(ctx context.Context, req EmbeddingReques
 }
 
 func (b *EmbeddingCircuitBreaker) fallback(ctx context.Context, req EmbeddingRequest, errs []error) (*EmbeddingResponse, error) {
-	for _, fallback := range b.fallbacks {
+	for i, fallback := range b.fallbacks {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		resp, err := fallback.Embed(ctx, req)
 		if err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return nil, ctxErr
 			}
+			disposition := classifyProviderError(err)
+			if !disposition.fallback {
+				return nil, err
+			}
 			errs = append(errs, err)
+			if i+1 < len(b.fallbacks) {
+				b.breaker.notifyFailover(ctx, fallback.client.providerID, i+1, b.fallbacks[i+1].client.providerID, err, false)
+			}
 			continue
 		}
 		return resp, nil

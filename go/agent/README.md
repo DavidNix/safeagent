@@ -5,8 +5,8 @@ A Go port of the core runtime of the [OpenAI Agents SDK](https://github.com/open
 guardrails, and a run loop that drives a model until a final output.
 
 The `agent` package is provider-agnostic. The top-level `llm` package provides
-plain-HTTP clients for OpenAI-compatible Chat Completions APIs (OpenAI,
-OpenRouter, Ollama, vLLM, etc.). It owns the wire types, so provider
+plain-HTTP clients for OpenAI-compatible Chat Completions and Embeddings APIs
+(OpenAI, OpenRouter, Ollama, vLLM, etc.). It owns the wire types, so provider
 extensions such as vLLM's `reasoning_content` are first-class.
 
 ## Quick start
@@ -288,23 +288,27 @@ request timeout, and the custom HTTP timeout.
 
 Wrap clients in `llm.CircuitBreaker` to try configured fallbacks when a request
 fails. Each provider gets a fresh request timeout derived from the caller's
-context. Any primary error counts toward opening the circuit while the caller
-context remains active. Cancellation or expiration of the caller context stops
-the chain immediately.
+context. Cancellation, expiration, and request serialization errors stop the
+chain immediately. HTTP 400, 412, 422, other unclassified 4xx responses, and
+local response-size limit errors fall back without counting against the
+primary. HTTP 401, 403, 404, 408, 413, 429, 5xx responses, transport errors,
+provider timeouts, and unusable successful responses count against it.
 
-Use `BreakerConfig.OnOpen` to trace when the failure threshold opens the
-circuit or a failed recovery probe reopens it. The callback runs synchronously
-outside the breaker lock and must be safe for concurrent use:
+Use `WithProviderID` or the provider configuration's `ProviderID` field with
+`BreakerConfig.OnFailover` to observe errors that cause another provider to be
+attempted. Routing directly to a fallback while the circuit is already open
+does not emit an event. The callback runs synchronously outside the breaker
+lock and must be safe for concurrent use:
 
 ```go
 breaker := llm.NewCircuitBreakerWithConfig(llm.BreakerConfig{
-	Name: "primary-chat",
-	OnOpen: func(ctx context.Context, event llm.BreakerOpenEvent) {
-		slog.WarnContext(ctx, "Circuit breaker opened",
-			"breaker", event.Name,
+	OnFailover: func(ctx context.Context, event llm.FailoverEvent) {
+		slog.WarnContext(ctx, "Failing over LLM provider",
+			"from", event.FromProvider,
+			"from_index", event.FromProviderIndex,
+			"to", event.ToProvider,
 			"error", event.Error,
-			"open_until", event.OpenUntil,
-			"was_probe", event.WasProbe,
+			"counted", event.CountedAgainstBreaker,
 		)
 	},
 }, primary, fallback)
@@ -316,12 +320,14 @@ failover behavior:
 
 ```go
 primary := llm.NewVLLMEmbedding(llm.VLLMEmbeddingConfig{
-	BaseURL: "http://ai1-inference:8001/v1",
-	Model:   "BAAI/bge-m3",
+	ProviderID: "vllm-primary",
+	BaseURL:    "http://ai1-inference:8001/v1",
+	Model:      "BAAI/bge-m3",
 })
 fallback := llm.NewOpenRouterEmbedding(llm.OpenRouterEmbeddingConfig{
-	APIKey: os.Getenv("OPENROUTER_API_KEY"),
-	Model:  "baai/bge-m3",
+	ProviderID: "openrouter-fallback",
+	APIKey:     os.Getenv("OPENROUTER_API_KEY"),
+	Model:      "baai/bge-m3",
 })
 embedder := llm.NewEmbeddingCircuitBreaker(primary, fallback)
 response, err := embedder.Embed(ctx, llm.EmbeddingRequest{

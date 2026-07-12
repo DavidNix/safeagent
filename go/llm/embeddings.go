@@ -23,6 +23,7 @@ type EmbeddingClient struct {
 
 // VLLMEmbeddingConfig configures a vLLM OpenAI-compatible Embeddings client.
 type VLLMEmbeddingConfig struct {
+	ProviderID  string
 	APIKey      string
 	BaseURL     string
 	Model       string
@@ -36,6 +37,7 @@ type VLLMEmbeddingConfig struct {
 func NewVLLMEmbedding(cfg VLLMEmbeddingConfig) *EmbeddingClient {
 	apiKey := cmp.Or(cfg.APIKey, defaultLocalAPIKey)
 	return NewEmbeddingClient(EmbeddingConfig{Model: cfg.Model},
+		WithProviderID(cfg.ProviderID),
 		WithAPIKey(apiKey),
 		WithBaseURL(cfg.BaseURL),
 		WithHeaders(cfg.Headers),
@@ -46,6 +48,7 @@ func NewVLLMEmbedding(cfg VLLMEmbeddingConfig) *EmbeddingClient {
 
 // OpenRouterEmbeddingConfig configures OpenRouter's Embeddings API.
 type OpenRouterEmbeddingConfig struct {
+	ProviderID               string
 	APIKey                   string
 	BaseURL                  string
 	Model                    string
@@ -79,6 +82,7 @@ func NewOpenRouterEmbedding(cfg OpenRouterEmbeddingConfig) *EmbeddingClient {
 	}
 
 	return NewEmbeddingClient(EmbeddingConfig{Model: cfg.Model},
+		WithProviderID(cfg.ProviderID),
 		WithAPIKey(cfg.APIKey),
 		WithBaseURL(baseURL),
 		WithHeaders(headers),
@@ -131,13 +135,30 @@ type wireEmbeddingRequest struct {
 
 // Embed creates float-encoded embeddings with one provider request.
 func (c *EmbeddingClient) Embed(ctx context.Context, req EmbeddingRequest) (*EmbeddingResponse, error) {
-	ctx, cancel := c.client.requestContext(ctx)
-	defer cancel()
+	body, err := c.prepareEmbeddingRequest(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	return c.embed(ctx, body, req)
+}
 
+func (c *EmbeddingClient) prepareEmbeddingRequest(ctx context.Context, req EmbeddingRequest) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	body, err := c.marshalRequest(req)
 	if err != nil {
-		return nil, fmt.Errorf("marshal embeddings request: %w", err)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
+		return nil, &requestSerializationError{operation: "embeddings", err: err}
 	}
+	return body, nil
+}
+
+func (c *EmbeddingClient) embed(ctx context.Context, body []byte, req EmbeddingRequest) (*EmbeddingResponse, error) {
+	ctx, cancel := c.client.requestContext(ctx)
+	defer cancel()
 
 	resp, err := c.roundTrip(ctx, body)
 	if err != nil {

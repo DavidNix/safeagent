@@ -3,33 +3,33 @@ package llm
 import (
 	"context"
 	"errors"
+	"net/http"
 	"sync"
 	"time"
 )
 
-// BreakerConfig configures primary-provider circuit breaking. OnOpen runs
+// BreakerConfig configures primary-provider circuit breaking. Callbacks run
 // synchronously outside the breaker lock and must be safe for concurrent use.
 type BreakerConfig struct {
-	Name                     string
 	FailureThreshold         int
 	OpenDuration             time.Duration
 	ProbeInterval            time.Duration
 	SuccessfulProbeThreshold int
-	OnOpen                   func(context.Context, BreakerOpenEvent)
+	OnFailover               func(context.Context, FailoverEvent)
 }
 
-// BreakerOpenEvent describes a circuit opening after failures or a failed
-// recovery probe. Error is the primary request error that opened the circuit.
-type BreakerOpenEvent struct {
-	Name      string
-	Error     error
-	OpenUntil time.Time
-	WasProbe  bool
+// FailoverEvent describes an error-triggered transition to another provider.
+type FailoverEvent struct {
+	FromProvider          string
+	FromProviderIndex     int
+	ToProvider            string
+	Error                 error
+	CountedAgainstBreaker bool
 }
 
 // CircuitBreaker routes Chat Completions requests through a primary client and
 // optional fallbacks. With no fallbacks it is a pass-through wrapper. The
-// breaker records every primary error while the caller context remains active.
+// breaker records errors that indicate the primary provider is unavailable.
 type CircuitBreaker struct {
 	primary   *Client
 	fallbacks []*Client
@@ -52,11 +52,11 @@ func NewCircuitBreakerWithConfig(cfg BreakerConfig, primary *Client, fallbacks .
 	}
 }
 
-// Complete sends a Chat Completions request. A primary failure is recorded
-// against the breaker and immediately falls through to configured fallbacks;
-// each client is attempted once.
+// Complete sends a Chat Completions request. Provider failures immediately
+// fall through to configured fallbacks; each client is attempted once.
 func (b *CircuitBreaker) Complete(ctx context.Context, req ChatRequest) (*ChatResponse, error) {
-	if err := ctx.Err(); err != nil {
+	body, err := b.primary.prepareChatRequest(ctx, req)
+	if err != nil {
 		return nil, err
 	}
 	decision := b.breaker.decide()
@@ -64,15 +64,24 @@ func (b *CircuitBreaker) Complete(ctx context.Context, req ChatRequest) (*ChatRe
 		return b.fallback(ctx, req, nil)
 	}
 
-	resp, err := b.primary.Complete(ctx, req)
+	resp, err := b.primary.complete(ctx, body)
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			b.breaker.releaseProbe(decision.wasProbe)
+			return nil, ctxErr
+		}
+		disposition := classifyProviderError(err)
+		if !disposition.fallback {
+			return nil, err
+		}
+		b.breaker.recordResult(decision.wasProbe, disposition.counted)
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return nil, ctxErr
 		}
-		b.breaker.recordFailure(ctx, err, decision.wasProbe)
 		if len(b.fallbacks) == 0 {
 			return nil, err
 		}
+		b.breaker.notifyFailover(ctx, b.primary.providerID, 0, b.fallbacks[0].providerID, err, disposition.counted)
 		return b.fallback(ctx, req, []error{err})
 	}
 
@@ -81,13 +90,23 @@ func (b *CircuitBreaker) Complete(ctx context.Context, req ChatRequest) (*ChatRe
 }
 
 func (b *CircuitBreaker) fallback(ctx context.Context, req ChatRequest, errs []error) (*ChatResponse, error) {
-	for _, fallback := range b.fallbacks {
+	for i, fallback := range b.fallbacks {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		resp, err := fallback.Complete(ctx, req)
 		if err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return nil, ctxErr
 			}
+			disposition := classifyProviderError(err)
+			if !disposition.fallback {
+				return nil, err
+			}
 			errs = append(errs, err)
+			if i+1 < len(b.fallbacks) {
+				b.breaker.notifyFailover(ctx, fallback.providerID, i+1, b.fallbacks[i+1].providerID, err, false)
+			}
 			continue
 		}
 		return resp, nil
@@ -106,8 +125,7 @@ type circuitBreaker struct {
 	consecutiveProbeSuccesses int
 	openUntil                 time.Time
 	probeInFlight             bool
-	name                      string
-	onOpen                    func(context.Context, BreakerOpenEvent)
+	onFailover                func(context.Context, FailoverEvent)
 }
 
 type breakerDecision struct {
@@ -133,8 +151,7 @@ func newCircuitBreaker(cfg BreakerConfig, hasFallbacks bool) *circuitBreaker {
 		successfulProbeThreshold = defaultSuccessfulProbePass
 	}
 	return &circuitBreaker{
-		name:                     cfg.Name,
-		onOpen:                   cfg.OnOpen,
+		onFailover:               cfg.OnFailover,
 		hasFallbacks:             hasFallbacks,
 		failureThreshold:         failureThreshold,
 		openDuration:             openDuration,
@@ -182,11 +199,11 @@ func (b *circuitBreaker) recordSuccess(wasProbe bool) {
 	b.openUntil = time.Now().Add(b.probeInterval)
 }
 
-func (b *circuitBreaker) recordFailure(ctx context.Context, err error, wasProbe bool) {
+func (b *circuitBreaker) recordFailure(wasProbe bool) {
 	b.mu.Lock()
+	defer b.mu.Unlock()
 
 	if !b.hasFallbacks {
-		b.mu.Unlock()
 		return
 	}
 
@@ -194,35 +211,81 @@ func (b *circuitBreaker) recordFailure(ctx context.Context, err error, wasProbe 
 		b.probeInFlight = false
 		b.consecutiveProbeSuccesses = 0
 		b.openUntil = time.Now().Add(b.openDuration)
-		event := b.openEvent(err, true)
-		b.mu.Unlock()
-		b.notifyOpen(ctx, event)
 		return
 	}
 
 	b.consecutiveFailures++
 	if b.consecutiveFailures < b.failureThreshold {
-		b.mu.Unlock()
 		return
 	}
 	b.consecutiveProbeSuccesses = 0
 	b.openUntil = time.Now().Add(b.openDuration)
-	event := b.openEvent(err, false)
-	b.mu.Unlock()
-	b.notifyOpen(ctx, event)
 }
 
-func (b *circuitBreaker) openEvent(err error, wasProbe bool) BreakerOpenEvent {
-	return BreakerOpenEvent{
-		Name:      b.name,
-		Error:     err,
-		OpenUntil: b.openUntil,
-		WasProbe:  wasProbe,
+func (b *circuitBreaker) recordResult(wasProbe, counted bool) {
+	if counted {
+		b.recordFailure(wasProbe)
+		return
+	}
+	b.recordNeutral(wasProbe)
+}
+
+func (b *circuitBreaker) recordNeutral(wasProbe bool) {
+	if !wasProbe {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.probeInFlight = false
+	b.openUntil = time.Now().Add(b.probeInterval)
+}
+
+func (b *circuitBreaker) releaseProbe(wasProbe bool) {
+	if !wasProbe {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.probeInFlight = false
+}
+
+func (b *circuitBreaker) notifyFailover(ctx context.Context, fromProvider string, fromProviderIndex int, toProvider string, err error, counted bool) {
+	if b.onFailover != nil {
+		b.onFailover(ctx, FailoverEvent{
+			FromProvider:          fromProvider,
+			FromProviderIndex:     fromProviderIndex,
+			ToProvider:            toProvider,
+			Error:                 err,
+			CountedAgainstBreaker: counted,
+		})
 	}
 }
 
-func (b *circuitBreaker) notifyOpen(ctx context.Context, event BreakerOpenEvent) {
-	if b.onOpen != nil {
-		b.onOpen(ctx, event)
+type errorDisposition struct {
+	fallback bool
+	counted  bool
+}
+
+func classifyProviderError(err error) errorDisposition {
+	if _, ok := errors.AsType[*requestSerializationError](err); ok {
+		return errorDisposition{}
 	}
+	if _, ok := errors.AsType[*ResponseTooLargeError](err); ok {
+		return errorDisposition{fallback: true}
+	}
+	if statusErr, ok := errors.AsType[*StatusError](err); ok {
+		switch statusErr.StatusCode {
+		case http.StatusBadRequest, http.StatusPreconditionFailed, http.StatusUnprocessableEntity:
+			return errorDisposition{fallback: true}
+		case http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound,
+			http.StatusRequestTimeout, http.StatusRequestEntityTooLarge, http.StatusTooManyRequests:
+			return errorDisposition{fallback: true, counted: true}
+		default:
+			return errorDisposition{
+				fallback: true,
+				counted:  statusErr.StatusCode < http.StatusBadRequest || statusErr.StatusCode >= http.StatusInternalServerError,
+			}
+		}
+	}
+	return errorDisposition{fallback: true, counted: true}
 }

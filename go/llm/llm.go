@@ -1,6 +1,6 @@
 // Package llm provides plain-HTTP clients for OpenAI-compatible Chat
-// Completions APIs. It owns the wire-level request and response types and does
-// not depend on the agent runtime.
+// Completions and Embeddings APIs. It owns the wire-level request and response
+// types and does not depend on the agent runtime.
 package llm
 
 import (
@@ -39,6 +39,7 @@ const (
 
 // Client calls an OpenAI-compatible Chat Completions API.
 type Client struct {
+	providerID     string
 	model          string
 	apiKey         string
 	baseURL        string
@@ -56,6 +57,11 @@ type Option func(*Client)
 // WithAPIKey overrides the bearer token used for API requests.
 func WithAPIKey(key string) Option {
 	return func(c *Client) { c.apiKey = key }
+}
+
+// WithProviderID identifies the provider in circuit-breaker failover events.
+func WithProviderID(providerID string) Option {
+	return func(c *Client) { c.providerID = providerID }
 }
 
 // WithBaseURL overrides the API base URL, for example to point at vLLM or
@@ -131,6 +137,7 @@ func NewClient(model string, opts ...Option) *Client {
 
 // VLLMConfig configures a vLLM OpenAI-compatible Chat Completions client.
 type VLLMConfig struct {
+	ProviderID  string
 	APIKey      string
 	ChatBaseURL string
 	ChatModel   string
@@ -154,6 +161,7 @@ func NewVLLM(cfg VLLMConfig) *Client {
 	maps.Copy(extraFields, vllmReasoningFields(cfg.ReasoningTokenBudget))
 
 	return NewClient(cfg.ChatModel,
+		WithProviderID(cfg.ProviderID),
 		WithAPIKey(apiKey),
 		WithBaseURL(cfg.ChatBaseURL),
 		WithHeaders(cfg.Headers),
@@ -165,6 +173,7 @@ func NewVLLM(cfg VLLMConfig) *Client {
 // OpenRouterConfig configures OpenRouter's OpenAI-compatible Chat Completions
 // API.
 type OpenRouterConfig struct {
+	ProviderID               string
 	APIKey                   string
 	BaseURL                  string
 	ChatModel                string
@@ -198,6 +207,7 @@ func NewOpenRouter(cfg OpenRouterConfig) *Client {
 	}
 
 	return NewClient(cfg.ChatModel,
+		WithProviderID(cfg.ProviderID),
 		WithAPIKey(cfg.APIKey),
 		WithBaseURL(baseURL),
 		WithHeaders(headers),
@@ -328,7 +338,7 @@ type ModelsResponse struct {
 	Data   []ModelInfo `json:"data"`
 }
 
-// StatusError reports a non-200 response from the Chat Completions API.
+// StatusError reports a non-200 response from a provider API.
 type StatusError struct {
 	StatusCode int
 	Body       string
@@ -361,15 +371,45 @@ type wireChatRequest struct {
 	ChatRequest
 }
 
+type requestSerializationError struct {
+	operation string
+	err       error
+}
+
+func (e *requestSerializationError) Error() string {
+	return fmt.Sprintf("marshal %s request: %v", e.operation, e.err)
+}
+
+func (e *requestSerializationError) Unwrap() error {
+	return e.err
+}
+
 // Complete sends one Chat Completions request.
 func (c *Client) Complete(ctx context.Context, req ChatRequest) (*ChatResponse, error) {
-	ctx, cancel := c.requestContext(ctx)
-	defer cancel()
+	body, err := c.prepareChatRequest(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	return c.complete(ctx, body)
+}
 
+func (c *Client) prepareChatRequest(ctx context.Context, req ChatRequest) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	body, err := c.marshalRequest(req)
 	if err != nil {
-		return nil, fmt.Errorf("marshal chat completions request: %w", err)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
+		return nil, &requestSerializationError{operation: "chat completions", err: err}
 	}
+	return body, nil
+}
+
+func (c *Client) complete(ctx context.Context, body []byte) (*ChatResponse, error) {
+	ctx, cancel := c.requestContext(ctx)
+	defer cancel()
 	return c.roundTrip(ctx, body)
 }
 

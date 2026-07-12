@@ -15,6 +15,7 @@ const (
 	openRouterAPIKeyEnv             = "OPENROUTER_API_KEY"
 	openRouterE2EModel              = "qwen/qwen3.6-35b-a3b"
 	vllmBaseURLEnv                  = "VLLM_BASE_URL"
+	vllmEmbeddingBaseURLEnv         = "VLLM_EMBEDDING_BASE_URL"
 	e2eTimeout                      = 2 * time.Minute
 	e2eMaxCompletionTokens          = 32
 	e2eReasoningTokenBudget         = 256

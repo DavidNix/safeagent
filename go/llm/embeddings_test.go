@@ -2,8 +2,10 @@ package llm_test
 
 import (
 	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"testing/synctest"
@@ -12,8 +14,6 @@ import (
 	"github.com/DavidNix/safeagent/llm"
 	"github.com/stretchr/testify/require"
 )
-
-const vllmEmbeddingBaseURL = "http://ai1-inference:8001/v1"
 
 func TestEmbeddingClient_Embed(t *testing.T) {
 	t.Parallel()
@@ -65,10 +65,12 @@ func TestEmbeddingClient_Embed(t *testing.T) {
 		fallbackServer := embeddingServer(t, http.StatusOK, fallbackRequest, nil)
 		t.Cleanup(fallbackServer.Close)
 		primary := llm.NewVLLMEmbedding(llm.VLLMEmbeddingConfig{
-			BaseURL: primaryServer.URL,
-			Model:   "vllm-embed",
+			ProviderID: "vllm-primary",
+			BaseURL:    primaryServer.URL,
+			Model:      "vllm-embed",
 		})
 		fallback := llm.NewOpenRouterEmbedding(llm.OpenRouterEmbeddingConfig{
+			ProviderID:               "openrouter-fallback",
 			APIKey:                   "openrouter-key",
 			BaseURL:                  fallbackServer.URL,
 			Model:                    "openrouter-embed",
@@ -78,7 +80,12 @@ func TestEmbeddingClient_Embed(t *testing.T) {
 			Headers:                  map[string]string{"X-Test": "yes"},
 			QueryParams:              map[string]string{"route": "openrouter"},
 		})
-		breaker := llm.NewEmbeddingCircuitBreaker(primary, fallback)
+		events := make(chan llm.FailoverEvent, 1)
+		breaker := llm.NewEmbeddingCircuitBreakerWithConfig(llm.BreakerConfig{
+			OnFailover: func(_ context.Context, event llm.FailoverEvent) {
+				events <- event
+			},
+		}, primary, fallback)
 
 		_, err := breaker.Embed(t.Context(), llm.EmbeddingRequest{Input: []string{"first", "second"}})
 
@@ -91,13 +98,17 @@ func TestEmbeddingClient_Embed(t *testing.T) {
 		require.Equal(t, "openrouter", fallbackRequest.Query.Get("route"))
 		provider := fallbackRequest.JSONBody["provider"].(map[string]any)
 		require.Equal(t, true, provider["zdr"])
+		event := <-events
+		require.Equal(t, "vllm-primary", event.FromProvider)
+		require.Equal(t, "openrouter-fallback", event.ToProvider)
 	})
 
 	t.Run("e2e vllm embedding client", func(t *testing.T) {
 		skipE2EInShortMode(t)
+		baseURL := requireE2EEnv(t, vllmEmbeddingBaseURLEnv)
 		ctx, cancel := e2eContext(t)
 		defer cancel()
-		client := newVLLMEmbeddingE2EClient(t, ctx)
+		client := newVLLMEmbeddingE2EClient(t, ctx, baseURL)
 
 		resp, err := client.Embed(ctx, llm.EmbeddingRequest{Input: []string{"SafeAgent embedding end-to-end test"}})
 
@@ -165,10 +176,217 @@ func TestEmbeddingClient_Embed(t *testing.T) {
 			require.ErrorIs(t, err, context.DeadlineExceeded)
 		})
 	})
+
+	t.Run("caller cancellation takes precedence over serialization", func(t *testing.T) {
+		client := llm.NewEmbeddingClient(llm.EmbeddingConfig{Model: "embed-test"},
+			llm.WithExtraFields(map[string]any{"invalid": func() {}}))
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+
+		_, err := client.Embed(ctx, llm.EmbeddingRequest{Input: []string{"hello"}})
+
+		require.ErrorIs(t, err, context.Canceled)
+	})
 }
 
 func TestEmbeddingCircuitBreaker_Embed(t *testing.T) {
 	t.Parallel()
+
+	t.Run("serialization error does not fall back", func(t *testing.T) {
+		var fallbackHits atomic.Int32
+		fallbackServer := embeddingServer(t, http.StatusOK, nil, &fallbackHits)
+		t.Cleanup(fallbackServer.Close)
+		primary := llm.NewEmbeddingClient(llm.EmbeddingConfig{Model: "primary"},
+			llm.WithExtraFields(map[string]any{"invalid": func() {}}))
+		fallback := llm.NewEmbeddingClient(llm.EmbeddingConfig{Model: "fallback"}, llm.WithBaseURL(fallbackServer.URL))
+		breaker := llm.NewEmbeddingCircuitBreaker(primary, fallback)
+
+		_, err := breaker.Embed(t.Context(), llm.EmbeddingRequest{Input: []string{"hello", "world"}})
+
+		require.EqualError(t, err, "marshal embeddings request: json: unsupported type: func()")
+		require.Equal(t, int32(0), fallbackHits.Load())
+	})
+
+	t.Run("fallback serialization error stops chain", func(t *testing.T) {
+		primaryServer := embeddingServer(t, http.StatusInternalServerError, nil, nil)
+		t.Cleanup(primaryServer.Close)
+		var finalHits atomic.Int32
+		finalServer := embeddingServer(t, http.StatusOK, nil, &finalHits)
+		t.Cleanup(finalServer.Close)
+		primary := llm.NewEmbeddingClient(llm.EmbeddingConfig{Model: "primary"}, llm.WithBaseURL(primaryServer.URL))
+		invalid := llm.NewEmbeddingClient(llm.EmbeddingConfig{Model: "invalid"},
+			llm.WithExtraFields(map[string]any{"invalid": func() {}}))
+		final := llm.NewEmbeddingClient(llm.EmbeddingConfig{Model: "final"}, llm.WithBaseURL(finalServer.URL))
+		breaker := llm.NewEmbeddingCircuitBreaker(primary, invalid, final)
+
+		_, err := breaker.Embed(t.Context(), llm.EmbeddingRequest{Input: []string{"hello", "world"}})
+
+		require.EqualError(t, err, "marshal embeddings request: json: unsupported type: func()")
+		require.Equal(t, int32(0), finalHits.Load())
+	})
+
+	t.Run("bad request falls back without opening circuit", func(t *testing.T) {
+		var primaryHits atomic.Int32
+		primaryServer := embeddingServer(t, http.StatusBadRequest, nil, &primaryHits)
+		t.Cleanup(primaryServer.Close)
+		fallbackServer := embeddingServer(t, http.StatusOK, nil, nil)
+		t.Cleanup(fallbackServer.Close)
+		primary := llm.NewEmbeddingClient(llm.EmbeddingConfig{Model: "shared"}, llm.WithBaseURL(primaryServer.URL))
+		fallback := llm.NewEmbeddingClient(llm.EmbeddingConfig{Model: "shared"}, llm.WithBaseURL(fallbackServer.URL))
+		breaker := llm.NewEmbeddingCircuitBreakerWithConfig(llm.BreakerConfig{FailureThreshold: 1}, primary, fallback)
+
+		for range 2 {
+			_, err := breaker.Embed(t.Context(), llm.EmbeddingRequest{Input: []string{"hello", "world"}})
+			require.NoError(t, err)
+		}
+
+		require.Equal(t, int32(2), primaryHits.Load())
+	})
+
+	t.Run("local response limit falls back without opening circuit", func(t *testing.T) {
+		var primaryHits atomic.Int32
+		primaryServer := embeddingServer(t, http.StatusOK, nil, &primaryHits)
+		t.Cleanup(primaryServer.Close)
+		fallbackServer := embeddingServer(t, http.StatusOK, nil, nil)
+		t.Cleanup(fallbackServer.Close)
+		primary := llm.NewEmbeddingClient(llm.EmbeddingConfig{Model: "shared"},
+			llm.WithBaseURL(primaryServer.URL), llm.WithMaxResponseBytes(8))
+		fallback := llm.NewEmbeddingClient(llm.EmbeddingConfig{Model: "shared"}, llm.WithBaseURL(fallbackServer.URL))
+		breaker := llm.NewEmbeddingCircuitBreakerWithConfig(llm.BreakerConfig{FailureThreshold: 1}, primary, fallback)
+
+		for range 2 {
+			_, err := breaker.Embed(t.Context(), llm.EmbeddingRequest{Input: []string{"hello", "world"}})
+			require.NoError(t, err)
+		}
+
+		require.Equal(t, int32(2), primaryHits.Load())
+	})
+
+	t.Run("invalid successful response falls back and opens circuit", func(t *testing.T) {
+		var primaryHits atomic.Int32
+		primary := llm.NewEmbeddingClient(llm.EmbeddingConfig{Model: "shared"},
+			llm.WithHTTPClient(&http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+				primaryHits.Add(1)
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     make(http.Header),
+					Body:       io.NopCloser(strings.NewReader(`{"data":[]}`)),
+				}, nil
+			})}))
+		fallbackServer := embeddingServer(t, http.StatusOK, nil, nil)
+		t.Cleanup(fallbackServer.Close)
+		fallback := llm.NewEmbeddingClient(llm.EmbeddingConfig{Model: "shared"}, llm.WithBaseURL(fallbackServer.URL))
+		breaker := llm.NewEmbeddingCircuitBreakerWithConfig(llm.BreakerConfig{FailureThreshold: 1}, primary, fallback)
+
+		for range 2 {
+			_, err := breaker.Embed(t.Context(), llm.EmbeddingRequest{Input: []string{"hello", "world"}})
+			require.NoError(t, err)
+		}
+
+		require.Equal(t, int32(1), primaryHits.Load())
+	})
+
+	t.Run("caller cancellation during primary does not fall back", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		primary := llm.NewEmbeddingClient(llm.EmbeddingConfig{Model: "shared"},
+			llm.WithHTTPClient(&http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+				cancel()
+				return nil, context.Canceled
+			})}))
+		var fallbackHits atomic.Int32
+		fallbackServer := embeddingServer(t, http.StatusOK, nil, &fallbackHits)
+		t.Cleanup(fallbackServer.Close)
+		fallback := llm.NewEmbeddingClient(llm.EmbeddingConfig{Model: "shared"}, llm.WithBaseURL(fallbackServer.URL))
+		breaker := llm.NewEmbeddingCircuitBreaker(primary, fallback)
+
+		_, err := breaker.Embed(ctx, llm.EmbeddingRequest{Input: []string{"hello", "world"}})
+
+		require.ErrorIs(t, err, context.Canceled)
+		require.Equal(t, int32(0), fallbackHits.Load())
+	})
+
+	t.Run("caller cancellation releases recovery probe", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			var mode atomic.Int32
+			var primaryHits atomic.Int32
+			cancelProbe := func() {}
+			primary := llm.NewEmbeddingClient(llm.EmbeddingConfig{Model: "shared"},
+				llm.WithHTTPClient(&http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+					primaryHits.Add(1)
+					switch mode.Load() {
+					case 0:
+						return testHTTPResponse(http.StatusForbidden, ""), nil
+					case 1:
+						cancelProbe()
+						return nil, context.Canceled
+					default:
+						return testEmbeddingHTTPResponse(), nil
+					}
+				})}))
+			fallback := llm.NewEmbeddingClient(llm.EmbeddingConfig{Model: "shared"},
+				llm.WithHTTPClient(&http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+					return testEmbeddingHTTPResponse(), nil
+				})}))
+			breaker := llm.NewEmbeddingCircuitBreakerWithConfig(llm.BreakerConfig{
+				FailureThreshold: 1,
+				OpenDuration:     time.Minute,
+			}, primary, fallback)
+
+			_, err := breaker.Embed(t.Context(), llm.EmbeddingRequest{Input: []string{"hello", "world"}})
+			require.NoError(t, err)
+			time.Sleep(time.Minute)
+
+			mode.Store(1)
+			probeCtx, cancel := context.WithCancel(t.Context())
+			cancelProbe = cancel
+			_, err = breaker.Embed(probeCtx, llm.EmbeddingRequest{Input: []string{"hello", "world"}})
+			require.ErrorIs(t, err, context.Canceled)
+
+			mode.Store(2)
+			resp, err := breaker.Embed(t.Context(), llm.EmbeddingRequest{Input: []string{"hello", "world"}})
+			require.NoError(t, err)
+			require.Len(t, resp.Data, 2)
+			require.Equal(t, int32(3), primaryHits.Load())
+		})
+	})
+
+	t.Run("failover events identify each failed provider", func(t *testing.T) {
+		primaryServer := embeddingServer(t, http.StatusBadRequest, nil, nil)
+		t.Cleanup(primaryServer.Close)
+		firstFallbackServer := embeddingServer(t, http.StatusInternalServerError, nil, nil)
+		t.Cleanup(firstFallbackServer.Close)
+		finalServer := embeddingServer(t, http.StatusOK, nil, nil)
+		t.Cleanup(finalServer.Close)
+		primary := llm.NewEmbeddingClient(llm.EmbeddingConfig{Model: "shared"},
+			llm.WithProviderID("primary"), llm.WithBaseURL(primaryServer.URL))
+		firstFallback := llm.NewEmbeddingClient(llm.EmbeddingConfig{Model: "shared"},
+			llm.WithProviderID("fallback-1"), llm.WithBaseURL(firstFallbackServer.URL))
+		final := llm.NewEmbeddingClient(llm.EmbeddingConfig{Model: "shared"},
+			llm.WithProviderID("fallback-2"), llm.WithBaseURL(finalServer.URL))
+		events := make(chan llm.FailoverEvent, 2)
+		breaker := llm.NewEmbeddingCircuitBreakerWithConfig(llm.BreakerConfig{
+			FailureThreshold: 1,
+			OnFailover: func(_ context.Context, event llm.FailoverEvent) {
+				events <- event
+			},
+		}, primary, firstFallback, final)
+
+		resp, err := breaker.Embed(t.Context(), llm.EmbeddingRequest{Input: []string{"hello", "world"}})
+
+		require.NoError(t, err)
+		require.Len(t, resp.Data, 2)
+		require.Len(t, events, 2)
+		first := <-events
+		require.Equal(t, "primary", first.FromProvider)
+		require.Equal(t, 0, first.FromProviderIndex)
+		require.Equal(t, "fallback-1", first.ToProvider)
+		require.False(t, first.CountedAgainstBreaker)
+		second := <-events
+		require.Equal(t, "fallback-1", second.FromProvider)
+		require.Equal(t, 1, second.FromProviderIndex)
+		require.Equal(t, "fallback-2", second.ToProvider)
+		require.False(t, second.CountedAgainstBreaker)
+	})
 
 	t.Run("trigger failure falls back with the same request", func(t *testing.T) {
 		primaryServer := embeddingServer(t, http.StatusServiceUnavailable, nil, nil)
@@ -209,38 +427,12 @@ func TestEmbeddingCircuitBreaker_Embed(t *testing.T) {
 		require.Equal(t, int32(1), fallbackHits.Load())
 	})
 
-	t.Run("opening circuit emits triggering error", func(t *testing.T) {
-		primaryServer := embeddingServer(t, http.StatusBadRequest, nil, nil)
-		t.Cleanup(primaryServer.Close)
-		fallbackServer := embeddingServer(t, http.StatusOK, nil, nil)
-		t.Cleanup(fallbackServer.Close)
-		primary := llm.NewEmbeddingClient(llm.EmbeddingConfig{Model: "primary"}, llm.WithBaseURL(primaryServer.URL))
-		fallback := llm.NewEmbeddingClient(llm.EmbeddingConfig{Model: "fallback"}, llm.WithBaseURL(fallbackServer.URL))
-		events := make(chan llm.BreakerOpenEvent, 1)
-		breaker := llm.NewEmbeddingCircuitBreakerWithConfig(llm.BreakerConfig{
-			Name:             "embedding-primary",
-			FailureThreshold: 1,
-			OnOpen: func(_ context.Context, event llm.BreakerOpenEvent) {
-				events <- event
-			},
-		}, primary, fallback)
-
-		_, err := breaker.Embed(t.Context(), llm.EmbeddingRequest{Input: []string{"hello", "world"}})
-
-		require.NoError(t, err)
-		event := <-events
-		require.Equal(t, "embedding-primary", event.Name)
-		require.False(t, event.WasProbe)
-		var statusErr *llm.StatusError
-		require.ErrorAs(t, event.Error, &statusErr)
-		require.Equal(t, http.StatusBadRequest, statusErr.StatusCode)
-	})
-
 	t.Run("e2e primary failure falls back to vllm", func(t *testing.T) {
 		skipE2EInShortMode(t)
+		baseURL := requireE2EEnv(t, vllmEmbeddingBaseURLEnv)
 		ctx, cancel := e2eContext(t)
 		defer cancel()
-		fallback := newVLLMEmbeddingE2EClient(t, ctx)
+		fallback := newVLLMEmbeddingE2EClient(t, ctx, baseURL)
 		primaryServer := embeddingServer(t, http.StatusServiceUnavailable, nil, nil)
 		t.Cleanup(primaryServer.Close)
 		primary := llm.NewEmbeddingClient(llm.EmbeddingConfig{
@@ -256,15 +448,15 @@ func TestEmbeddingCircuitBreaker_Embed(t *testing.T) {
 	})
 }
 
-func newVLLMEmbeddingE2EClient(t *testing.T, ctx context.Context) *llm.EmbeddingClient {
+func newVLLMEmbeddingE2EClient(t *testing.T, ctx context.Context, baseURL string) *llm.EmbeddingClient {
 	t.Helper()
-	model := vllmEmbeddingModel(t, ctx)
-	return llm.NewVLLMEmbedding(llm.VLLMEmbeddingConfig{BaseURL: vllmEmbeddingBaseURL, Model: model})
+	model := vllmEmbeddingModel(t, ctx, baseURL)
+	return llm.NewVLLMEmbedding(llm.VLLMEmbeddingConfig{BaseURL: baseURL, Model: model})
 }
 
-func vllmEmbeddingModel(t *testing.T, ctx context.Context) string {
+func vllmEmbeddingModel(t *testing.T, ctx context.Context, baseURL string) string {
 	t.Helper()
-	modelsClient := llm.NewClient("ignored", llm.WithBaseURL(vllmEmbeddingBaseURL))
+	modelsClient := llm.NewClient("ignored", llm.WithBaseURL(baseURL))
 	models, err := modelsClient.Models(ctx)
 	require.NoError(t, err)
 	require.NotEmpty(t, models.Data, "vLLM embeddings models response returned no models")
@@ -302,4 +494,17 @@ func writeEmbeddingResponse(w http.ResponseWriter) {
 		"model":"embed-test",
 		"usage":{"prompt_tokens":4,"total_tokens":4}
 	}`))
+}
+
+func testEmbeddingHTTPResponse() *http.Response {
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     make(http.Header),
+		Body: io.NopCloser(strings.NewReader(`{
+			"data":[
+				{"index":0,"embedding":[0.25,-0.5]},
+				{"index":1,"embedding":[0.75,1.0]}
+			]
+		}`)),
+	}
 }

@@ -153,11 +153,13 @@ func TestClient_Complete(t *testing.T) {
 
 		budget := 128
 		primary := llm.NewVLLM(llm.VLLMConfig{
+			ProviderID:           "vllm-primary",
 			ChatBaseURL:          primaryServer.URL,
 			ChatModel:            "vllm-chat",
 			ReasoningTokenBudget: &budget,
 		})
 		fallback := llm.NewOpenRouter(llm.OpenRouterConfig{
+			ProviderID:               "openrouter-fallback",
 			APIKey:                   "openrouter-key",
 			BaseURL:                  fallbackServer.URL,
 			ChatModel:                "openrouter-chat",
@@ -167,7 +169,12 @@ func TestClient_Complete(t *testing.T) {
 			Headers:                  map[string]string{"X-OpenRouter-Test": "yes"},
 			QueryParams:              map[string]string{"route": "openrouter"},
 		})
-		breaker := llm.NewCircuitBreaker(primary, fallback)
+		events := make(chan llm.FailoverEvent, 1)
+		breaker := llm.NewCircuitBreakerWithConfig(llm.BreakerConfig{
+			OnFailover: func(_ context.Context, event llm.FailoverEvent) {
+				events <- event
+			},
+		}, primary, fallback)
 
 		resp, err := breaker.Complete(t.Context(), llm.ChatRequest{Messages: []llm.ChatMessage{{Role: "user", Content: "hello"}}})
 
@@ -189,6 +196,9 @@ func TestClient_Complete(t *testing.T) {
 		provider, ok := fallbackRequest.JSONBody["provider"].(map[string]any)
 		require.True(t, ok)
 		require.Equal(t, true, provider["zdr"])
+		event := <-events
+		require.Equal(t, "vllm-primary", event.FromProvider)
+		require.Equal(t, "openrouter-fallback", event.ToProvider)
 	})
 
 	t.Run("openrouter zero data retention overrides provider parent field", func(t *testing.T) {
@@ -324,6 +334,16 @@ func TestClient_Complete(t *testing.T) {
 
 			require.ErrorIs(t, err, context.DeadlineExceeded)
 		})
+	})
+
+	t.Run("caller cancellation takes precedence over serialization", func(t *testing.T) {
+		client := llm.NewClient("gpt-test")
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+
+		_, err := client.Complete(ctx, llm.ChatRequest{ToolChoice: func() {}})
+
+		require.ErrorIs(t, err, context.Canceled)
 	})
 
 	t.Run("zero request timeout disables client deadline", func(t *testing.T) {
