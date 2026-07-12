@@ -11,7 +11,7 @@ import (
 	"testing/synctest"
 	"time"
 
-	"github.com/DavidNix/safeagent/llm"
+	"github.com/DavidNix/safeagent/go/llm"
 	"github.com/stretchr/testify/require"
 )
 

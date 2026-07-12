@@ -1,6 +1,6 @@
 package agent
 
-import "github.com/DavidNix/safeagent/llm"
+import "github.com/DavidNix/safeagent/go/llm"
 
 // ModelSettings holds tunable generation parameters passed to the model.
 // Nil pointer fields are omitted from provider requests.

@@ -13,8 +13,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/DavidNix/safeagent/agent"
-	"github.com/DavidNix/safeagent/llm"
+	"github.com/DavidNix/safeagent/go/agent"
+	"github.com/DavidNix/safeagent/go/llm"
 	"github.com/stretchr/testify/require"
 )
 

@@ -6,8 +6,8 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/DavidNix/safeagent/agent"
-	"github.com/DavidNix/safeagent/llm"
+	"github.com/DavidNix/safeagent/go/agent"
+	"github.com/DavidNix/safeagent/go/llm"
 )
 
 type modelFunc func(context.Context, llm.ChatRequest) (*llm.ChatResponse, error)

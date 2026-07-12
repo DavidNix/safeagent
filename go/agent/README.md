@@ -15,8 +15,8 @@ extensions such as vLLM's `reasoning_content` are first-class.
 import (
 	"os"
 
-	"github.com/DavidNix/safeagent/agent"
-	"github.com/DavidNix/safeagent/llm"
+	"github.com/DavidNix/safeagent/go/agent"
+	"github.com/DavidNix/safeagent/go/llm"
 )
 
 model := llm.NewOpenRouter(llm.OpenRouterConfig{

@@ -3,7 +3,7 @@ package agent_test
 import (
 	"testing"
 
-	"github.com/DavidNix/safeagent/agent"
+	"github.com/DavidNix/safeagent/go/agent"
 	"github.com/stretchr/testify/require"
 )
 

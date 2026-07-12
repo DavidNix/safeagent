@@ -1,4 +1,4 @@
-module github.com/DavidNix/safeagent
+module github.com/DavidNix/safeagent/go
 
 go 1.26.4
 

@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 
-	"github.com/DavidNix/safeagent/llm"
+	"github.com/DavidNix/safeagent/go/llm"
 )
 
 // ToolDefinition is the serialized form of a tool sent to the model.

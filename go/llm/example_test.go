@@ -7,7 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 
-	"github.com/DavidNix/safeagent/llm"
+	"github.com/DavidNix/safeagent/go/llm"
 )
 
 func writeJSON(w http.ResponseWriter, value any) {

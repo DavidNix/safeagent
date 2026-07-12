@@ -4,7 +4,7 @@ import (
 	"context"
 	"log/slog"
 
-	"github.com/DavidNix/safeagent/llm"
+	"github.com/DavidNix/safeagent/go/llm"
 )
 
 // Tracer observes the lifecycle of agent runs. Inject one via Runner.Tracer;

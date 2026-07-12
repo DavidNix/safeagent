@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"slices"
 
-	"github.com/DavidNix/safeagent/llm"
+	"github.com/DavidNix/safeagent/go/llm"
 	"golang.org/x/sync/errgroup"
 )
 
