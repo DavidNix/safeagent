@@ -277,9 +277,62 @@ in the same way.
 The `llm` package options include `llm.WithBaseURL` (point it at any
 OpenAI-compatible server), `llm.WithAPIKey`, `llm.WithHTTPClient`, static
 headers/query params, and constructor-level JSON extra fields for provider
-extensions. `llm.Client` defaults to zero retries; configure
-`llm.WithMaxRetries` explicitly or wrap clients in `llm.CircuitBreaker` for
-immediate failover on HTTP 429, 5xx, and transport failures.
+extensions. Each client is attempted once and has a 60-second request timeout
+by default. Use `llm.WithRequestTimeout` to change it; zero or a negative
+duration disables the client-level timeout.
+
+The package-created HTTP client has no separate `http.Client.Timeout`. A custom
+client passed through `llm.WithHTTPClient` keeps its own timeout, so the
+effective limit is the earliest of the caller context deadline, the SafeAgent
+request timeout, and the custom HTTP timeout.
+
+Wrap clients in `llm.CircuitBreaker` to try configured fallbacks when a request
+fails. Each provider gets a fresh request timeout derived from the caller's
+context. Any primary error counts toward opening the circuit while the caller
+context remains active. Cancellation or expiration of the caller context stops
+the chain immediately.
+
+Use `BreakerConfig.OnOpen` to trace when the failure threshold opens the
+circuit or a failed recovery probe reopens it. The callback runs synchronously
+outside the breaker lock and must be safe for concurrent use:
+
+```go
+breaker := llm.NewCircuitBreakerWithConfig(llm.BreakerConfig{
+	Name: "primary-chat",
+	OnOpen: func(ctx context.Context, event llm.BreakerOpenEvent) {
+		slog.WarnContext(ctx, "Circuit breaker opened",
+			"breaker", event.Name,
+			"error", event.Error,
+			"open_until", event.OpenUntil,
+			"was_probe", event.WasProbe,
+		)
+	},
+}, primary, fallback)
+```
+
+For embeddings, use `llm.NewEmbeddingClient`, `llm.NewVLLMEmbedding`, or
+`llm.NewOpenRouterEmbedding`. `llm.EmbeddingCircuitBreaker` provides the same
+failover behavior:
+
+```go
+primary := llm.NewVLLMEmbedding(llm.VLLMEmbeddingConfig{
+	BaseURL: "http://ai1-inference:8001/v1",
+	Model:   "BAAI/bge-m3",
+})
+fallback := llm.NewOpenRouterEmbedding(llm.OpenRouterEmbeddingConfig{
+	APIKey: os.Getenv("OPENROUTER_API_KEY"),
+	Model:  "baai/bge-m3",
+})
+embedder := llm.NewEmbeddingCircuitBreaker(primary, fallback)
+response, err := embedder.Embed(ctx, llm.EmbeddingRequest{
+	Input: []string{"first document", "second document"},
+})
+```
+
+The library does not validate embedding-model compatibility. Callers must
+configure every fallback to use the same model weights and embedding settings
+as the primary. Equal vector dimensions and similar model names do not make
+embeddings from different models compatible.
 
 Reasoning models served with a reasoning parser (for example
 `vllm serve ... --reasoning-parser deepseek_r1`) return their thinking in a

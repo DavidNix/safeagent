@@ -7,19 +7,29 @@ import (
 	"time"
 )
 
-// BreakerConfig configures primary-provider circuit breaking.
+// BreakerConfig configures primary-provider circuit breaking. OnOpen runs
+// synchronously outside the breaker lock and must be safe for concurrent use.
 type BreakerConfig struct {
+	Name                     string
 	FailureThreshold         int
 	OpenDuration             time.Duration
 	ProbeInterval            time.Duration
 	SuccessfulProbeThreshold int
-	Now                      func() time.Time
+	OnOpen                   func(context.Context, BreakerOpenEvent)
+}
+
+// BreakerOpenEvent describes a circuit opening after failures or a failed
+// recovery probe. Error is the primary request error that opened the circuit.
+type BreakerOpenEvent struct {
+	Name      string
+	Error     error
+	OpenUntil time.Time
+	WasProbe  bool
 }
 
 // CircuitBreaker routes Chat Completions requests through a primary client and
 // optional fallbacks. With no fallbacks it is a pass-through wrapper. The
-// breaker records retryable provider and transport failures using the same
-// rules as Client retries.
+// breaker records every primary error while the caller context remains active.
 type CircuitBreaker struct {
 	primary   *Client
 	fallbacks []*Client
@@ -42,37 +52,40 @@ func NewCircuitBreakerWithConfig(cfg BreakerConfig, primary *Client, fallbacks .
 	}
 }
 
-// Complete sends a Chat Completions request. A retryable primary failure is
-// recorded against the breaker and immediately falls through to configured
-// fallbacks; Client retries are zero by default.
+// Complete sends a Chat Completions request. A primary failure is recorded
+// against the breaker and immediately falls through to configured fallbacks;
+// each client is attempted once.
 func (b *CircuitBreaker) Complete(ctx context.Context, req ChatRequest) (*ChatResponse, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	decision := b.breaker.decide()
-	if decision.routePrimary {
-		resp, err := b.primary.Complete(ctx, req)
-		if err != nil {
-			if !isTriggerError(ctx, err) {
-				return nil, err
-			}
-			b.breaker.recordFailure(decision.wasProbe)
-			if len(b.fallbacks) == 0 {
-				return nil, err
-			}
-			return b.fallback(ctx, req, []error{err})
-		}
-
-		b.breaker.recordSuccess(decision.wasProbe)
-		return resp, nil
+	if !decision.routePrimary {
+		return b.fallback(ctx, req, nil)
 	}
 
-	return b.fallback(ctx, req, nil)
+	resp, err := b.primary.Complete(ctx, req)
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
+		b.breaker.recordFailure(ctx, err, decision.wasProbe)
+		if len(b.fallbacks) == 0 {
+			return nil, err
+		}
+		return b.fallback(ctx, req, []error{err})
+	}
+
+	b.breaker.recordSuccess(decision.wasProbe)
+	return resp, nil
 }
 
 func (b *CircuitBreaker) fallback(ctx context.Context, req ChatRequest, errs []error) (*ChatResponse, error) {
 	for _, fallback := range b.fallbacks {
 		resp, err := fallback.Complete(ctx, req)
 		if err != nil {
-			if !isTriggerError(ctx, err) {
-				return nil, err
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, ctxErr
 			}
 			errs = append(errs, err)
 			continue
@@ -84,7 +97,6 @@ func (b *CircuitBreaker) fallback(ctx context.Context, req ChatRequest, errs []e
 
 type circuitBreaker struct {
 	mu                        sync.Mutex
-	now                       func() time.Time
 	hasFallbacks              bool
 	failureThreshold          int
 	openDuration              time.Duration
@@ -94,6 +106,8 @@ type circuitBreaker struct {
 	consecutiveProbeSuccesses int
 	openUntil                 time.Time
 	probeInFlight             bool
+	name                      string
+	onOpen                    func(context.Context, BreakerOpenEvent)
 }
 
 type breakerDecision struct {
@@ -118,13 +132,9 @@ func newCircuitBreaker(cfg BreakerConfig, hasFallbacks bool) *circuitBreaker {
 	if successfulProbeThreshold <= 0 {
 		successfulProbeThreshold = defaultSuccessfulProbePass
 	}
-	now := cfg.Now
-	if now == nil {
-		now = time.Now
-	}
-
 	return &circuitBreaker{
-		now:                      now,
+		name:                     cfg.Name,
+		onOpen:                   cfg.OnOpen,
 		hasFallbacks:             hasFallbacks,
 		failureThreshold:         failureThreshold,
 		openDuration:             openDuration,
@@ -141,7 +151,7 @@ func (b *circuitBreaker) decide() breakerDecision {
 		return breakerDecision{routePrimary: true}
 	}
 
-	now := b.now()
+	now := time.Now()
 	if now.Before(b.openUntil) {
 		return breakerDecision{routePrimary: false}
 	}
@@ -169,23 +179,50 @@ func (b *circuitBreaker) recordSuccess(wasProbe bool) {
 		b.consecutiveProbeSuccesses = 0
 		return
 	}
-	b.openUntil = b.now().Add(b.probeInterval)
+	b.openUntil = time.Now().Add(b.probeInterval)
 }
 
-func (b *circuitBreaker) recordFailure(wasProbe bool) {
+func (b *circuitBreaker) recordFailure(ctx context.Context, err error, wasProbe bool) {
 	b.mu.Lock()
-	defer b.mu.Unlock()
+
+	if !b.hasFallbacks {
+		b.mu.Unlock()
+		return
+	}
 
 	if wasProbe {
 		b.probeInFlight = false
 		b.consecutiveProbeSuccesses = 0
-		b.openUntil = b.now().Add(b.openDuration)
+		b.openUntil = time.Now().Add(b.openDuration)
+		event := b.openEvent(err, true)
+		b.mu.Unlock()
+		b.notifyOpen(ctx, event)
 		return
 	}
 
 	b.consecutiveFailures++
-	if b.consecutiveFailures >= b.failureThreshold {
-		b.consecutiveProbeSuccesses = 0
-		b.openUntil = b.now().Add(b.openDuration)
+	if b.consecutiveFailures < b.failureThreshold {
+		b.mu.Unlock()
+		return
+	}
+	b.consecutiveProbeSuccesses = 0
+	b.openUntil = time.Now().Add(b.openDuration)
+	event := b.openEvent(err, false)
+	b.mu.Unlock()
+	b.notifyOpen(ctx, event)
+}
+
+func (b *circuitBreaker) openEvent(err error, wasProbe bool) BreakerOpenEvent {
+	return BreakerOpenEvent{
+		Name:      b.name,
+		Error:     err,
+		OpenUntil: b.openUntil,
+		WasProbe:  wasProbe,
+	}
+}
+
+func (b *circuitBreaker) notifyOpen(ctx context.Context, event BreakerOpenEvent) {
+	if b.onOpen != nil {
+		b.onOpen(ctx, event)
 	}
 }
