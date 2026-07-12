@@ -1,6 +1,3 @@
-// Package llm provides plain-HTTP clients for OpenAI-compatible Chat
-// Completions and Embeddings APIs. It owns the wire-level request and response
-// types and does not depend on the agent runtime.
 package llm
 
 import (

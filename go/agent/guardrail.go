@@ -12,24 +12,32 @@ type GuardrailOutput struct {
 
 // InputGuardrail validates the run input before the first model call.
 type InputGuardrail struct {
-	Name    string
+	// Name identifies the guardrail in results and errors.
+	Name string
+	// Execute evaluates the complete input item list.
 	Execute func(ctx context.Context, rc *RunContext, agent *Agent, input []Item) (GuardrailOutput, error)
 }
 
 // OutputGuardrail validates the final output of a run.
 type OutputGuardrail struct {
-	Name    string
+	// Name identifies the guardrail in results and errors.
+	Name string
+	// Execute evaluates the final assistant text.
 	Execute func(ctx context.Context, rc *RunContext, agent *Agent, output string) (GuardrailOutput, error)
 }
 
 // InputGuardrailResult pairs an input guardrail with its output.
 type InputGuardrailResult struct {
+	// GuardrailName identifies the guardrail that produced Output.
 	GuardrailName string
-	Output        GuardrailOutput
+	// Output is the guardrail's decision and optional diagnostic information.
+	Output GuardrailOutput
 }
 
 // OutputGuardrailResult pairs an output guardrail with its output.
 type OutputGuardrailResult struct {
+	// GuardrailName identifies the guardrail that produced Output.
 	GuardrailName string
-	Output        GuardrailOutput
+	// Output is the guardrail's decision and optional diagnostic information.
+	Output GuardrailOutput
 }

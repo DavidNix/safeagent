@@ -5,9 +5,13 @@ import "github.com/DavidNix/safeagent/llm"
 // ModelSettings holds tunable generation parameters passed to the model.
 // Nil pointer fields are omitted from provider requests.
 type ModelSettings struct {
-	Temperature       *float64
-	TopP              *float64
-	MaxTokens         *int
+	// Temperature controls output randomness when supported by the provider.
+	Temperature *float64
+	// TopP controls nucleus sampling when supported by the provider.
+	TopP *float64
+	// MaxTokens limits the number of tokens generated for a completion.
+	MaxTokens *int
+	// ParallelToolCalls controls whether the model may request tools in parallel.
 	ParallelToolCalls *bool
 	// ToolChoice is "auto", "required", "none", or the name of a specific
 	// tool the model must call.

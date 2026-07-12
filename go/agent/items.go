@@ -1,14 +1,14 @@
-// Package agent is a Go port of the core runtime of the OpenAI Agents SDK
-// (openai-agents-js): agents with instructions, function tools, handoffs,
-// guardrails, and a run loop that drives a Model until a final output.
 package agent
 
 // Role identifies the author of a message.
 type Role string
 
 const (
-	RoleSystem    Role = "system"
-	RoleUser      Role = "user"
+	// RoleSystem identifies instructions supplied by the application.
+	RoleSystem Role = "system"
+	// RoleUser identifies input supplied by a user.
+	RoleUser Role = "user"
+	// RoleAssistant identifies output supplied by a model.
 	RoleAssistant Role = "assistant"
 )
 

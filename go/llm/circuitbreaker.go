@@ -11,19 +11,32 @@ import (
 // BreakerConfig configures primary-provider circuit breaking. Callbacks run
 // synchronously outside the breaker lock and must be safe for concurrent use.
 type BreakerConfig struct {
-	FailureThreshold         int
-	OpenDuration             time.Duration
-	ProbeInterval            time.Duration
+	// FailureThreshold is the number of consecutive counted primary failures
+	// required to open the circuit. Values below one use the package default.
+	FailureThreshold int
+	// OpenDuration is how long an opened circuit bypasses the primary before a
+	// recovery probe may run.
+	OpenDuration time.Duration
+	// ProbeInterval controls the delay between recovery probes.
+	ProbeInterval time.Duration
+	// SuccessfulProbeThreshold is the number of consecutive successful probes
+	// required to close the circuit.
 	SuccessfulProbeThreshold int
-	OnFailover               func(context.Context, FailoverEvent)
+	// OnFailover receives each transition from a failed provider to a fallback.
+	OnFailover func(context.Context, FailoverEvent)
 }
 
 // FailoverEvent describes an error-triggered transition to another provider.
 type FailoverEvent struct {
-	FromProvider          string
-	FromProviderIndex     int
-	ToProvider            string
-	Error                 error
+	// FromProvider is the configured ID of the provider that failed.
+	FromProvider string
+	// FromProviderIndex is zero for the primary and one-based for fallbacks.
+	FromProviderIndex int
+	// ToProvider is the configured ID of the next provider to be attempted.
+	ToProvider string
+	// Error is the provider error that caused failover.
+	Error error
+	// CountedAgainstBreaker reports whether Error affected primary circuit state.
 	CountedAgainstBreaker bool
 }
 
