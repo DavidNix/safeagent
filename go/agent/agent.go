@@ -21,7 +21,7 @@ type Agent struct {
 	HandoffDescription string
 	// Model produces responses for the agent.
 	Model Model
-	// ModelSettings tunes generation parameters.
+	// ModelSettings tunes model request and generation parameters.
 	ModelSettings ModelSettings
 	// Tools are the function tools available to the model.
 	Tools []Tool

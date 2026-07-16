@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"maps"
 	"net/http"
+	"time"
 )
 
 // EmbeddingConfig identifies an embedding model.
@@ -104,6 +105,9 @@ type EmbeddingRequest struct {
 	Input      []string `json:"input"`
 	Dimensions *int     `json:"dimensions,omitempty"`
 	User       string   `json:"user,omitempty"`
+	// RequestTimeout overrides the client timeout for each provider attempt.
+	// Zero uses the client default; a negative duration disables it.
+	RequestTimeout time.Duration `json:"-"`
 }
 
 // Embedding is one vector returned by the Embeddings API.
@@ -157,7 +161,7 @@ func (c *EmbeddingClient) prepareEmbeddingRequest(ctx context.Context, req Embed
 }
 
 func (c *EmbeddingClient) embed(ctx context.Context, body []byte, req EmbeddingRequest) (*EmbeddingResponse, error) {
-	ctx, cancel := c.client.requestContext(ctx)
+	ctx, cancel := c.client.requestContext(ctx, req.RequestTimeout)
 	defer cancel()
 
 	resp, err := c.roundTrip(ctx, body)

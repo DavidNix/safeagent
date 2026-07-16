@@ -339,6 +339,36 @@ func TestCircuitBreaker_Complete(t *testing.T) {
 		})
 	})
 
+	t.Run("request timeout falls back with a fresh timeout", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			primary := llm.NewClient("primary",
+				llm.WithRequestTimeout(time.Minute),
+				llm.WithHTTPClient(&http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+					<-req.Context().Done()
+					return nil, req.Context().Err()
+				})}),
+			)
+			fallback := llm.NewClient("fallback",
+				llm.WithRequestTimeout(time.Minute),
+				llm.WithHTTPClient(&http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+					deadline, ok := req.Context().Deadline()
+					require.True(t, ok)
+					require.Equal(t, 2*time.Second, time.Until(deadline))
+					return testHTTPResponse(http.StatusOK, "fallback"), nil
+				})}),
+			)
+			breaker := llm.NewCircuitBreaker(primary, fallback)
+
+			resp, err := breaker.Complete(t.Context(), llm.ChatRequest{
+				Messages:       []llm.ChatMessage{{Role: "user", Content: "hello"}},
+				RequestTimeout: 2 * time.Second,
+			})
+
+			require.NoError(t, err)
+			require.Equal(t, "fallback", resp.Choices[0].Message.Content)
+		})
+	})
+
 	t.Run("circuit opens after threshold and skips primary until probe succeeds", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			var primaryHits atomic.Int32

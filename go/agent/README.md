@@ -212,10 +212,12 @@ ag.InstructionsFunc = func(ctx context.Context, rc *agent.RunContext, a *agent.A
 }
 ```
 
-`ModelSettings` tunes generation per agent: `Temperature`, `TopP`,
-`MaxTokens`, `ParallelToolCalls` (nil pointers are omitted from the request),
-`ToolChoice` (`"auto"`, `"required"`, `"none"`, or a tool name to force), and
-`StructuredOutput`.
+`ModelSettings` tunes requests per agent: `RequestTimeout`, `Temperature`,
+`TopP`, `MaxTokens`, `ParallelToolCalls` (nil pointers are omitted from the
+request), `ToolChoice` (`"auto"`, `"required"`, `"none"`, or a tool name to
+force), and `StructuredOutput`. `RequestTimeout` applies separately to each
+provider attempt; zero uses the client's default and a negative duration
+disables the client timeout.
 
 `StructuredOutput` requests modern JSON Schema structured output. The client
 does not expose the legacy `json_object` mode and does not validate the model's
@@ -312,21 +314,35 @@ The `llm` package options include `llm.WithBaseURL` (point it at any
 OpenAI-compatible server), `llm.WithAPIKey`, `llm.WithHTTPClient`, static
 headers/query params, and constructor-level JSON extra fields for provider
 extensions. Each client is attempted once and has a 60-second request timeout
-by default. Use `llm.WithRequestTimeout` to change it; zero or a negative
-duration disables the client-level timeout.
+by default. Use `llm.WithRequestTimeout` to change the client default; zero or
+a negative duration disables it.
+
+Set `ChatRequest.RequestTimeout` or `EmbeddingRequest.RequestTimeout` to
+override that default for one logical request. A positive duration applies
+separately to each provider attempt, zero inherits the client default, and a
+negative duration disables the client timeout for that request. Agent runs set
+the same override through `ModelSettings.RequestTimeout`:
+
+```go
+ctx, cancel := context.WithTimeout(ctx, 45*time.Second)
+defer cancel()
+
+assistant.ModelSettings.RequestTimeout = 10 * time.Second
+result, err := agent.Run(ctx, assistant, "Help me troubleshoot this request.")
+```
 
 The package-created HTTP client has no separate `http.Client.Timeout`. A custom
-client passed through `llm.WithHTTPClient` keeps its own timeout, so the
-effective limit is the earliest of the caller context deadline, the SafeAgent
-request timeout, and the custom HTTP timeout.
+client passed through `llm.WithHTTPClient` keeps its own timeout, so each
+attempt's effective limit is the earliest of the caller context deadline, the
+request override or client default, and the custom HTTP timeout.
 
 Wrap clients in `llm.CircuitBreaker` to try configured fallbacks when a request
-fails. Each provider gets a fresh request timeout derived from the caller's
-context. Cancellation, expiration, and request serialization errors stop the
-chain immediately. HTTP 400, 412, 422, other unclassified 4xx responses, and
-local response-size limit errors fall back without counting against the
-primary. HTTP 401, 403, 404, 408, 413, 429, 5xx responses, transport errors,
-provider timeouts, and unusable successful responses count against it.
+fails. Each provider gets a fresh request timeout bounded by the caller's
+context. Caller cancellation, caller expiration, and request serialization
+errors stop the chain immediately. HTTP 400, 412, 422, other unclassified 4xx
+responses, and local response-size limit errors fall back without counting
+against the primary. HTTP 401, 403, 404, 408, 413, 429, 5xx responses, transport
+errors, provider timeouts, and unusable successful responses count against it.
 
 Use `WithProviderID` or the provider configuration's `ProviderID` field with
 `BreakerConfig.OnFailover` to observe errors that cause another provider to be

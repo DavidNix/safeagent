@@ -32,9 +32,10 @@ func TestEmbeddingClient_Embed(t *testing.T) {
 		)
 
 		resp, err := client.Embed(t.Context(), llm.EmbeddingRequest{
-			Input:      []string{"first", "second"},
-			Dimensions: &dimensions,
-			User:       "user-1",
+			RequestTimeout: time.Minute,
+			Input:          []string{"first", "second"},
+			Dimensions:     &dimensions,
+			User:           "user-1",
 		})
 
 		require.NoError(t, err)
@@ -177,6 +178,28 @@ func TestEmbeddingClient_Embed(t *testing.T) {
 		})
 	})
 
+	t.Run("request timeout overrides client default", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			client := llm.NewEmbeddingClient(llm.EmbeddingConfig{Model: "embed-test"},
+				llm.WithRequestTimeout(time.Second),
+				llm.WithHTTPClient(&http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+					deadline, ok := req.Context().Deadline()
+					require.True(t, ok)
+					require.Equal(t, 2*time.Second, time.Until(deadline))
+					return testEmbeddingHTTPResponse(), nil
+				})}),
+			)
+
+			resp, err := client.Embed(t.Context(), llm.EmbeddingRequest{
+				Input:          []string{"hello", "world"},
+				RequestTimeout: 2 * time.Second,
+			})
+
+			require.NoError(t, err)
+			require.Len(t, resp.Data, 2)
+		})
+	})
+
 	t.Run("caller cancellation takes precedence over serialization", func(t *testing.T) {
 		client := llm.NewEmbeddingClient(llm.EmbeddingConfig{Model: "embed-test"},
 			llm.WithExtraFields(map[string]any{"invalid": func() {}}))
@@ -303,6 +326,36 @@ func TestEmbeddingCircuitBreaker_Embed(t *testing.T) {
 
 		require.ErrorIs(t, err, context.Canceled)
 		require.Equal(t, int32(0), fallbackHits.Load())
+	})
+
+	t.Run("request timeout falls back with a fresh timeout", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			primary := llm.NewEmbeddingClient(llm.EmbeddingConfig{Model: "shared"},
+				llm.WithRequestTimeout(time.Minute),
+				llm.WithHTTPClient(&http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+					<-req.Context().Done()
+					return nil, req.Context().Err()
+				})}),
+			)
+			fallback := llm.NewEmbeddingClient(llm.EmbeddingConfig{Model: "shared"},
+				llm.WithRequestTimeout(time.Minute),
+				llm.WithHTTPClient(&http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+					deadline, ok := req.Context().Deadline()
+					require.True(t, ok)
+					require.Equal(t, 2*time.Second, time.Until(deadline))
+					return testEmbeddingHTTPResponse(), nil
+				})}),
+			)
+			breaker := llm.NewEmbeddingCircuitBreaker(primary, fallback)
+
+			resp, err := breaker.Embed(t.Context(), llm.EmbeddingRequest{
+				Input:          []string{"hello", "world"},
+				RequestTimeout: 2 * time.Second,
+			})
+
+			require.NoError(t, err)
+			require.Len(t, resp.Data, 2)
+		})
 	})
 
 	t.Run("caller cancellation releases recovery probe", func(t *testing.T) {

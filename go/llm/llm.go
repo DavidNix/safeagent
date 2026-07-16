@@ -19,7 +19,7 @@ import (
 const (
 	// DefaultBaseURL is the OpenRouter OpenAI-compatible API base URL.
 	DefaultBaseURL = "https://openrouter.ai/api/v1"
-	// DefaultRequestTimeout is the maximum duration of one provider request.
+	// DefaultRequestTimeout is the default maximum duration of one provider request.
 	DefaultRequestTimeout = 60 * time.Second
 	// DefaultMaxResponseBytes caps response bodies at 64 MiB. This is generous
 	// for current OpenAI-compatible max completion sizes while still preventing
@@ -95,8 +95,8 @@ func WithMaxResponseBytes(n int64) Option {
 	return func(c *Client) { c.maxRespBody = n }
 }
 
-// WithRequestTimeout overrides the maximum duration of one provider request.
-// Zero or a negative duration disables the client-level timeout.
+// WithRequestTimeout overrides the client's default maximum duration of one
+// provider request. Zero or a negative duration disables the client default.
 func WithRequestTimeout(timeout time.Duration) Option {
 	return func(c *Client) { c.requestTimeout = timeout }
 }
@@ -224,6 +224,9 @@ type ChatRequest struct {
 	ParallelToolCalls *bool             `json:"parallel_tool_calls,omitempty"`
 	ToolChoice        any               `json:"tool_choice,omitempty"`
 	StructuredOutput  *StructuredOutput `json:"-"`
+	// RequestTimeout overrides the client timeout for each provider attempt.
+	// Zero uses the client default; a negative duration disables it.
+	RequestTimeout time.Duration `json:"-"`
 }
 
 // StructuredOutput constrains a chat completion to a JSON Schema. Providers
@@ -414,7 +417,7 @@ func (c *Client) Complete(ctx context.Context, req ChatRequest) (*ChatResponse, 
 	if err != nil {
 		return nil, err
 	}
-	return c.complete(ctx, body)
+	return c.complete(ctx, body, req.RequestTimeout)
 }
 
 func (c *Client) prepareChatRequest(ctx context.Context, req ChatRequest) ([]byte, error) {
@@ -431,15 +434,15 @@ func (c *Client) prepareChatRequest(ctx context.Context, req ChatRequest) ([]byt
 	return body, nil
 }
 
-func (c *Client) complete(ctx context.Context, body []byte) (*ChatResponse, error) {
-	ctx, cancel := c.requestContext(ctx)
+func (c *Client) complete(ctx context.Context, body []byte, requestTimeout time.Duration) (*ChatResponse, error) {
+	ctx, cancel := c.requestContext(ctx, requestTimeout)
 	defer cancel()
 	return c.roundTrip(ctx, body)
 }
 
 // Models returns the models advertised by the configured OpenAI-compatible API.
 func (c *Client) Models(ctx context.Context) (*ModelsResponse, error) {
-	ctx, cancel := c.requestContext(ctx)
+	ctx, cancel := c.requestContext(ctx, 0)
 	defer cancel()
 
 	endpoint, err := c.endpoint("models")
@@ -587,11 +590,12 @@ func readResponseBody(r io.Reader, limit int64) ([]byte, error) {
 	return body, nil
 }
 
-func (c *Client) requestContext(ctx context.Context) (context.Context, context.CancelFunc) {
-	if c.requestTimeout <= 0 {
+func (c *Client) requestContext(ctx context.Context, requestTimeout time.Duration) (context.Context, context.CancelFunc) {
+	timeout := cmp.Or(requestTimeout, c.requestTimeout)
+	if timeout <= 0 {
 		return ctx, func() {}
 	}
-	return context.WithTimeout(ctx, c.requestTimeout)
+	return context.WithTimeout(ctx, timeout)
 }
 
 func newDefaultHTTPClient() *http.Client {

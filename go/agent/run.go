@@ -137,6 +137,7 @@ func buildChatRequest(instructions string, input []Item, settings ModelSettings,
 	return llm.ChatRequest{
 		Messages:          buildChatMessages(instructions, input),
 		Tools:             buildChatTools(tools, handoffs),
+		RequestTimeout:    settings.RequestTimeout,
 		Temperature:       settings.Temperature,
 		TopP:              settings.TopP,
 		MaxTokens:         settings.MaxTokens,

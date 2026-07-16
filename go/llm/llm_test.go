@@ -99,6 +99,7 @@ func TestClient_Complete(t *testing.T) {
 
 		client := llm.NewClient("gpt-test", llm.WithBaseURL(server.URL), llm.WithAPIKey("test-key"))
 		resp, err := client.Complete(t.Context(), llm.ChatRequest{
+			RequestTimeout: time.Minute,
 			Messages: []llm.ChatMessage{
 				{Role: "system", Content: "Be helpful"},
 				{Role: "user", Content: "What is the weather in SF?"},
@@ -406,6 +407,47 @@ func TestClient_Complete(t *testing.T) {
 
 			require.ErrorIs(t, err, context.DeadlineExceeded)
 		})
+	})
+
+	t.Run("request timeout overrides client default", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			client := llm.NewClient("gpt-test",
+				llm.WithRequestTimeout(time.Second),
+				llm.WithHTTPClient(&http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+					deadline, ok := req.Context().Deadline()
+					require.True(t, ok)
+					require.Equal(t, 2*time.Second, time.Until(deadline))
+					return testHTTPResponse(http.StatusOK, "ok"), nil
+				})}),
+			)
+
+			resp, err := client.Complete(t.Context(), llm.ChatRequest{
+				Messages:       []llm.ChatMessage{{Role: "user", Content: "hi"}},
+				RequestTimeout: 2 * time.Second,
+			})
+
+			require.NoError(t, err)
+			require.Equal(t, "ok", resp.Choices[0].Message.Content)
+		})
+	})
+
+	t.Run("negative request timeout disables client default", func(t *testing.T) {
+		client := llm.NewClient("gpt-test",
+			llm.WithRequestTimeout(time.Second),
+			llm.WithHTTPClient(&http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				_, hasDeadline := req.Context().Deadline()
+				require.False(t, hasDeadline)
+				return testHTTPResponse(http.StatusOK, "ok"), nil
+			})}),
+		)
+
+		resp, err := client.Complete(t.Context(), llm.ChatRequest{
+			Messages:       []llm.ChatMessage{{Role: "user", Content: "hi"}},
+			RequestTimeout: -1,
+		})
+
+		require.NoError(t, err)
+		require.Equal(t, "ok", resp.Choices[0].Message.Content)
 	})
 
 	t.Run("caller cancellation takes precedence over serialization", func(t *testing.T) {

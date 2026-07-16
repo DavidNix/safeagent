@@ -77,7 +77,7 @@ func (b *CircuitBreaker) Complete(ctx context.Context, req ChatRequest) (*ChatRe
 		return b.fallback(ctx, req, nil)
 	}
 
-	resp, err := b.primary.complete(ctx, body)
+	resp, err := b.primary.complete(ctx, body, req.RequestTimeout)
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			b.breaker.releaseProbe(decision.wasProbe)

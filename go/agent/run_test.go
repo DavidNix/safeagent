@@ -65,6 +65,7 @@ func cloneChatRequest(req llm.ChatRequest) llm.ChatRequest {
 func captureModelRequest(req llm.ChatRequest) capturedModelRequest {
 	captured := capturedModelRequest{
 		ModelSettings: agent.ModelSettings{
+			RequestTimeout:    req.RequestTimeout,
 			Temperature:       req.Temperature,
 			TopP:              req.TopP,
 			MaxTokens:         req.MaxTokens,
@@ -549,6 +550,22 @@ func TestRunner_Run(t *testing.T) {
 		require.Equal(t, `{"answer":"done"}`, result.FinalOutput)
 		require.Equal(t, output, model.rawRequests[0].StructuredOutput)
 		require.Equal(t, output, model.requests[0].ModelSettings.StructuredOutput)
+	})
+
+	t.Run("request timeout propagates from model settings", func(t *testing.T) {
+		model := &fakeModel{responses: []fakeModelResponse{{Output: []agent.Item{agent.AssistantMessage("done")}}}}
+		ag := &agent.Agent{
+			Name:          "assistant",
+			Model:         model,
+			ModelSettings: agent.ModelSettings{RequestTimeout: 15 * time.Second},
+		}
+
+		result, err := agent.Run(t.Context(), ag, "go")
+
+		require.NoError(t, err)
+		require.Equal(t, "done", result.FinalOutput)
+		require.Equal(t, 15*time.Second, model.rawRequests[0].RequestTimeout)
+		require.Equal(t, 15*time.Second, model.requests[0].ModelSettings.RequestTimeout)
 	})
 
 	t.Run("tool choice reset disabled", func(t *testing.T) {

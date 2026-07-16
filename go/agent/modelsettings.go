@@ -1,10 +1,17 @@
 package agent
 
-import "github.com/DavidNix/safeagent/go/llm"
+import (
+	"time"
 
-// ModelSettings holds tunable generation parameters passed to the model.
+	"github.com/DavidNix/safeagent/go/llm"
+)
+
+// ModelSettings holds request and generation parameters passed to the model.
 // Nil pointer fields are omitted from provider requests.
 type ModelSettings struct {
+	// RequestTimeout overrides the model client's timeout for each provider
+	// attempt. Zero uses the client default; a negative duration disables it.
+	RequestTimeout time.Duration
 	// Temperature controls output randomness when supported by the provider.
 	Temperature *float64
 	// TopP controls nucleus sampling when supported by the provider.
