@@ -135,15 +135,16 @@ func (r *Runner) runItems(ctx context.Context, tracer Tracer, agent *Agent, inpu
 
 func buildChatRequest(instructions string, input []Item, settings ModelSettings, tools []ToolDefinition, handoffs []HandoffDefinition) llm.ChatRequest {
 	return llm.ChatRequest{
-		Messages:          buildChatMessages(instructions, input),
-		Tools:             buildChatTools(tools, handoffs),
-		RequestTimeout:    settings.RequestTimeout,
-		Temperature:       settings.Temperature,
-		TopP:              settings.TopP,
-		MaxTokens:         settings.MaxTokens,
-		ParallelToolCalls: settings.ParallelToolCalls,
-		ToolChoice:        toolChoiceValue(settings.ToolChoice),
-		StructuredOutput:  settings.StructuredOutput,
+		Messages:             buildChatMessages(instructions, input),
+		Tools:                buildChatTools(tools, handoffs),
+		RequestTimeout:       settings.RequestTimeout,
+		Temperature:          settings.Temperature,
+		TopP:                 settings.TopP,
+		MaxTokens:            settings.MaxTokens,
+		ReasoningTokenBudget: settings.ReasoningTokenBudget,
+		ParallelToolCalls:    settings.ParallelToolCalls,
+		ToolChoice:           toolChoiceValue(settings.ToolChoice),
+		StructuredOutput:     settings.StructuredOutput,
 	}
 }
 

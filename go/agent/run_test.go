@@ -65,13 +65,14 @@ func cloneChatRequest(req llm.ChatRequest) llm.ChatRequest {
 func captureModelRequest(req llm.ChatRequest) capturedModelRequest {
 	captured := capturedModelRequest{
 		ModelSettings: agent.ModelSettings{
-			RequestTimeout:    req.RequestTimeout,
-			Temperature:       req.Temperature,
-			TopP:              req.TopP,
-			MaxTokens:         req.MaxTokens,
-			ParallelToolCalls: req.ParallelToolCalls,
-			ToolChoice:        toolChoiceString(req.ToolChoice),
-			StructuredOutput:  req.StructuredOutput,
+			RequestTimeout:       req.RequestTimeout,
+			Temperature:          req.Temperature,
+			TopP:                 req.TopP,
+			MaxTokens:            req.MaxTokens,
+			ReasoningTokenBudget: req.ReasoningTokenBudget,
+			ParallelToolCalls:    req.ParallelToolCalls,
+			ToolChoice:           toolChoiceString(req.ToolChoice),
+			StructuredOutput:     req.StructuredOutput,
 		},
 	}
 	toolNamesByCallID := map[string]string{}
@@ -237,7 +238,12 @@ func TestRunner_Run(t *testing.T) {
 		spanishModel := &fakeModel{responses: []fakeModelResponse{
 			{Output: []agent.Item{agent.AssistantMessage("¡Hola!")}, Usage: agent.Usage{Requests: 1}},
 		}}
-		spanish := &agent.Agent{Name: "Spanish agent", Model: spanishModel, HandoffDescription: "Speaks Spanish."}
+		spanish := &agent.Agent{
+			Name:               "Spanish agent",
+			Model:              spanishModel,
+			HandoffDescription: "Speaks Spanish.",
+			ModelSettings:      agent.ModelSettings{ReasoningTokenBudget: 256},
+		}
 
 		triageModel := &fakeModel{responses: []fakeModelResponse{
 			{
@@ -251,7 +257,12 @@ func TestRunner_Run(t *testing.T) {
 			handoffInput = input
 			return nil
 		}
-		triage := &agent.Agent{Name: "Triage", Model: triageModel, Handoffs: []agent.Handoff{handoff}}
+		triage := &agent.Agent{
+			Name:          "Triage",
+			Model:         triageModel,
+			Handoffs:      []agent.Handoff{handoff},
+			ModelSettings: agent.ModelSettings{ReasoningTokenBudget: 64},
+		}
 
 		runner := &agent.Runner{}
 		result, err := runner.Run(t.Context(), triage, "Hola")
@@ -266,11 +277,13 @@ func TestRunner_Run(t *testing.T) {
 			Output: `{"assistant":"Spanish agent"}`,
 		}))
 		require.Len(t, triageModel.requests, 1)
+		require.Equal(t, 64, triageModel.rawRequests[0].ReasoningTokenBudget)
 		require.Equal(t, "transfer_to_Spanish_agent", triageModel.requests[0].Handoffs[0].ToolName)
 		require.Equal(t,
 			"Handoff to the Spanish agent agent to handle the request. Speaks Spanish.",
 			triageModel.requests[0].Handoffs[0].ToolDescription)
 		require.Len(t, spanishModel.requests, 1)
+		require.Equal(t, 256, spanishModel.rawRequests[0].ReasoningTokenBudget)
 		require.Contains(t, spanishModel.requests[0].Input, agent.Item(agent.UserMessage("Hola")))
 	})
 
@@ -566,6 +579,22 @@ func TestRunner_Run(t *testing.T) {
 		require.Equal(t, "done", result.FinalOutput)
 		require.Equal(t, 15*time.Second, model.rawRequests[0].RequestTimeout)
 		require.Equal(t, 15*time.Second, model.requests[0].ModelSettings.RequestTimeout)
+	})
+
+	t.Run("reasoning token budget propagates from model settings", func(t *testing.T) {
+		model := &fakeModel{responses: []fakeModelResponse{{Output: []agent.Item{agent.AssistantMessage("done")}}}}
+		ag := &agent.Agent{
+			Name:          "assistant",
+			Model:         model,
+			ModelSettings: agent.ModelSettings{ReasoningTokenBudget: 256},
+		}
+
+		result, err := agent.Run(t.Context(), ag, "go")
+
+		require.NoError(t, err)
+		require.Equal(t, "done", result.FinalOutput)
+		require.Equal(t, 256, model.rawRequests[0].ReasoningTokenBudget)
+		require.Equal(t, 256, model.requests[0].ModelSettings.ReasoningTokenBudget)
 	})
 
 	t.Run("tool choice reset disabled", func(t *testing.T) {
@@ -917,12 +946,10 @@ func newVLLME2EClient(t *testing.T, ctx context.Context, baseURL string) *llm.Cl
 	require.NotEmpty(t, models.Data, "vLLM models response returned no models")
 	model := strings.TrimSpace(models.Data[0].ID)
 	require.NotEmpty(t, model, "first vLLM model ID is empty")
-	reasoningBudget := 0
 
 	return llm.NewVLLM(llm.VLLMConfig{
-		ChatBaseURL:          baseURL,
-		ChatModel:            model,
-		ReasoningTokenBudget: &reasoningBudget,
+		ChatBaseURL: baseURL,
+		ChatModel:   model,
 	})
 }
 
@@ -955,7 +982,11 @@ func TestAgent_AsTool(t *testing.T) {
 		innerModel := &fakeModel{responses: []fakeModelResponse{
 			{Output: []agent.Item{agent.AssistantMessage("short summary")}, Usage: agent.Usage{Requests: 1, TotalTokens: 5}},
 		}}
-		inner := &agent.Agent{Name: "Summarizer", Model: innerModel}
+		inner := &agent.Agent{
+			Name:          "Summarizer",
+			Model:         innerModel,
+			ModelSettings: agent.ModelSettings{ReasoningTokenBudget: 256},
+		}
 
 		outerModel := &fakeModel{responses: []fakeModelResponse{
 			{
@@ -965,9 +996,10 @@ func TestAgent_AsTool(t *testing.T) {
 			{Output: []agent.Item{agent.AssistantMessage("done: short summary")}, Usage: agent.Usage{Requests: 1, TotalTokens: 7}},
 		}}
 		outer := &agent.Agent{
-			Name:  "Writer",
-			Model: outerModel,
-			Tools: []agent.Tool{inner.AsTool("", "Summarize text")},
+			Name:          "Writer",
+			Model:         outerModel,
+			Tools:         []agent.Tool{inner.AsTool("", "Summarize text")},
+			ModelSettings: agent.ModelSettings{ReasoningTokenBudget: 64},
 		}
 
 		result, err := agent.Run(t.Context(), outer, "Summarize this")
@@ -975,6 +1007,8 @@ func TestAgent_AsTool(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, "done: short summary", result.FinalOutput)
 		require.Contains(t, result.NewItems, agent.Item(agent.ToolOutput{CallID: "call_1", Name: "Summarizer", Output: "short summary"}))
+		require.Equal(t, 64, outerModel.rawRequests[0].ReasoningTokenBudget)
+		require.Equal(t, 256, innerModel.rawRequests[0].ReasoningTokenBudget)
 		require.Equal(t, []agent.Item{agent.UserMessage("long text")}, innerModel.requests[0].Input)
 		require.Equal(t, agent.Usage{Requests: 3, TotalTokens: 22}, result.Usage)
 	})

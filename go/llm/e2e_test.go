@@ -53,9 +53,6 @@ func newOpenRouterE2EClient(apiKey, baseURL string) *llm.Client {
 		ChatModel: openRouterE2EModel,
 		SiteURL:   "https://github.com/DavidNix/safeagent",
 		AppTitle:  "SafeAgent E2E",
-		ExtraFields: map[string]any{
-			"reasoning.effort": "none",
-		},
 	}
 	if baseURL != "" {
 		cfg.BaseURL = baseURL
@@ -69,9 +66,6 @@ func newOpenRouterReasoningE2EClient(apiKey, baseURL string) *llm.Client {
 		ChatModel: openRouterE2EModel,
 		SiteURL:   "https://github.com/DavidNix/safeagent",
 		AppTitle:  "SafeAgent E2E",
-		ExtraFields: map[string]any{
-			"reasoning.max_tokens": e2eReasoningTokenBudget,
-		},
 	}
 	if baseURL != "" {
 		cfg.BaseURL = baseURL
@@ -82,24 +76,20 @@ func newOpenRouterReasoningE2EClient(apiKey, baseURL string) *llm.Client {
 func newVLLME2EClient(t *testing.T, ctx context.Context, baseURL string) *llm.Client {
 	t.Helper()
 	model := requireFirstVLLME2EModel(t, ctx, baseURL)
-	reasoningBudget := 0
 
 	return llm.NewVLLM(llm.VLLMConfig{
-		ChatBaseURL:          baseURL,
-		ChatModel:            model,
-		ReasoningTokenBudget: &reasoningBudget,
+		ChatBaseURL: baseURL,
+		ChatModel:   model,
 	})
 }
 
 func newVLLMReasoningE2EClient(t *testing.T, ctx context.Context, baseURL string) *llm.Client {
 	t.Helper()
 	model := requireFirstVLLME2EModel(t, ctx, baseURL)
-	reasoningBudget := e2eReasoningTokenBudget
 
 	return llm.NewVLLM(llm.VLLMConfig{
-		ChatBaseURL:          baseURL,
-		ChatModel:            model,
-		ReasoningTokenBudget: &reasoningBudget,
+		ChatBaseURL: baseURL,
+		ChatModel:   model,
 	})
 }
 
@@ -143,8 +133,9 @@ func runLLMReasoningE2ECompletion(t *testing.T, ctx context.Context, client e2eC
 			{Role: "system", Content: "You are running a SafeAgent reasoning end-to-end test. Think briefly, then include the requested marker in the final answer."},
 			{Role: "user", Content: "Think briefly about why 2+2=4, then include this marker in the final answer: " + marker},
 		},
-		Temperature: &temperature,
-		MaxTokens:   &maxTokens,
+		Temperature:          &temperature,
+		MaxTokens:            &maxTokens,
+		ReasoningTokenBudget: e2eReasoningTokenBudget,
 	})
 
 	require.NoError(t, err)

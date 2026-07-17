@@ -18,6 +18,9 @@ type ModelSettings struct {
 	TopP *float64
 	// MaxTokens limits the number of tokens generated for a completion.
 	MaxTokens *int
+	// ReasoningTokenBudget enables reasoning when greater than zero and limits
+	// the number of reasoning tokens when supported by the provider.
+	ReasoningTokenBudget int
 	// ParallelToolCalls controls whether the model may request tools in parallel.
 	ParallelToolCalls *bool
 	// ToolChoice is "auto", "required", "none", or the name of a specific

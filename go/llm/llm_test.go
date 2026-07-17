@@ -224,12 +224,17 @@ func TestClient_Complete(t *testing.T) {
 		fallbackServer := chatCompletionServer(t, http.StatusOK, `{"fallback":true}`, fallbackRequest, nil)
 		t.Cleanup(fallbackServer.Close)
 
-		budget := 128
 		primary := llm.NewVLLM(llm.VLLMConfig{
-			ProviderID:           "vllm-primary",
-			ChatBaseURL:          primaryServer.URL,
-			ChatModel:            "vllm-chat",
-			ReasoningTokenBudget: &budget,
+			ProviderID:  "vllm-primary",
+			ChatBaseURL: primaryServer.URL,
+			ChatModel:   "vllm-chat",
+			ExtraFields: map[string]any{
+				"reasoning":                            map[string]any{"effort": "none"},
+				"reasoning_effort":                     "none",
+				"thinking_token_budget":                1,
+				"chat_template_kwargs.test_value":      "preserved",
+				"chat_template_kwargs.enable_thinking": false,
+			},
 		})
 		fallback := llm.NewOpenRouter(llm.OpenRouterConfig{
 			ProviderID:               "openrouter-fallback",
@@ -241,6 +246,10 @@ func TestClient_Complete(t *testing.T) {
 			RequireZeroDataRetention: true,
 			Headers:                  map[string]string{"X-OpenRouter-Test": "yes"},
 			QueryParams:              map[string]string{"route": "openrouter"},
+			ExtraFields: map[string]any{
+				"reasoning":        map[string]any{"effort": "none", "exclude": true},
+				"reasoning_effort": "high",
+			},
 		})
 		events := make(chan llm.FailoverEvent, 1)
 		breaker := llm.NewCircuitBreakerWithConfig(llm.BreakerConfig{
@@ -249,15 +258,21 @@ func TestClient_Complete(t *testing.T) {
 			},
 		}, primary, fallback)
 
-		resp, err := breaker.Complete(t.Context(), llm.ChatRequest{Messages: []llm.ChatMessage{{Role: "user", Content: "hello"}}})
+		resp, err := breaker.Complete(t.Context(), llm.ChatRequest{
+			Messages:             []llm.ChatMessage{{Role: "user", Content: "hello"}},
+			ReasoningTokenBudget: 128,
+		})
 
 		require.NoError(t, err)
 		require.NotNil(t, resp)
 		require.Equal(t, "vllm-chat", primaryRequest.JSONBody["model"])
 		require.InDelta(t, 128, primaryRequest.JSONBody["thinking_token_budget"], 0.0001)
-		reasoning, ok := primaryRequest.JSONBody["reasoning"].(map[string]any)
+		chatTemplateKwargs, ok := primaryRequest.JSONBody["chat_template_kwargs"].(map[string]any)
 		require.True(t, ok)
-		require.InDelta(t, 128, reasoning["max_tokens"], 0.0001)
+		require.Equal(t, true, chatTemplateKwargs["enable_thinking"])
+		require.Equal(t, "preserved", chatTemplateKwargs["test_value"])
+		require.NotContains(t, primaryRequest.JSONBody, "reasoning")
+		require.NotContains(t, primaryRequest.JSONBody, "reasoning_effort")
 
 		require.Equal(t, "openrouter-chat", fallbackRequest.JSONBody["model"])
 		require.Equal(t, "Bearer openrouter-key", fallbackRequest.Header.Get("Authorization"))
@@ -266,6 +281,12 @@ func TestClient_Complete(t *testing.T) {
 		require.Equal(t, "yes", fallbackRequest.Header.Get("X-OpenRouter-Test"))
 		require.Equal(t, "openrouter", fallbackRequest.Query.Get("route"))
 		require.NotContains(t, fallbackRequest.JSONBody, "thinking_token_budget")
+		reasoning, ok := fallbackRequest.JSONBody["reasoning"].(map[string]any)
+		require.True(t, ok)
+		require.InDelta(t, 128, reasoning["max_tokens"], 0.0001)
+		require.NotContains(t, reasoning, "effort")
+		require.Equal(t, true, reasoning["exclude"])
+		require.NotContains(t, fallbackRequest.JSONBody, "reasoning_effort")
 		provider, ok := fallbackRequest.JSONBody["provider"].(map[string]any)
 		require.True(t, ok)
 		require.Equal(t, true, provider["zdr"])
@@ -334,19 +355,17 @@ func TestClient_Complete(t *testing.T) {
 		require.Equal(t, "", messages[3].(map[string]any)["content"])
 	})
 
-	t.Run("zero reasoning budget disables vllm thinking", func(t *testing.T) {
+	t.Run("reasoning is disabled by default for vllm", func(t *testing.T) {
 		request := &capturedRequest{}
 		server := chatCompletionServer(t, http.StatusOK, `{"ok":true}`, request, nil)
 		t.Cleanup(server.Close)
 
-		budget := 0
 		client := llm.NewVLLM(llm.VLLMConfig{
-			APIKey:               "local-key",
-			ChatBaseURL:          server.URL,
-			ChatModel:            "vllm-chat",
-			ReasoningTokenBudget: &budget,
-			Headers:              map[string]string{"X-VLLM-Header": "present"},
-			QueryParams:          map[string]string{"backend": "vllm"},
+			APIKey:      "local-key",
+			ChatBaseURL: server.URL,
+			ChatModel:   "vllm-chat",
+			Headers:     map[string]string{"X-VLLM-Header": "present"},
+			QueryParams: map[string]string{"backend": "vllm"},
 		})
 
 		_, err := client.Complete(t.Context(), llm.ChatRequest{Messages: []llm.ChatMessage{{Role: "user", Content: "hello"}}})
@@ -355,13 +374,31 @@ func TestClient_Complete(t *testing.T) {
 		require.Equal(t, "Bearer local-key", request.Header.Get("Authorization"))
 		require.Equal(t, "present", request.Header.Get("X-VLLM-Header"))
 		require.Equal(t, "vllm", request.Query.Get("backend"))
-		require.InDelta(t, 0, request.JSONBody["thinking_token_budget"], 0.0001)
+		require.NotContains(t, request.JSONBody, "thinking_token_budget")
+		require.Equal(t, "none", request.JSONBody["reasoning_effort"])
 		chatTemplateKwargs, ok := request.JSONBody["chat_template_kwargs"].(map[string]any)
 		require.True(t, ok)
 		require.Equal(t, false, chatTemplateKwargs["enable_thinking"])
+		require.NotContains(t, request.JSONBody, "reasoning")
+	})
+
+	t.Run("reasoning is disabled by default for openrouter", func(t *testing.T) {
+		request := &capturedRequest{}
+		server := chatCompletionServer(t, http.StatusOK, `{"ok":true}`, request, nil)
+		t.Cleanup(server.Close)
+		client := llm.NewOpenRouter(llm.OpenRouterConfig{
+			BaseURL:   server.URL,
+			ChatModel: "openrouter-chat",
+		})
+
+		_, err := client.Complete(t.Context(), llm.ChatRequest{Messages: []llm.ChatMessage{{Role: "user", Content: "hello"}}})
+
+		require.NoError(t, err)
 		reasoning, ok := request.JSONBody["reasoning"].(map[string]any)
 		require.True(t, ok)
 		require.Equal(t, "none", reasoning["effort"])
+		require.NotContains(t, reasoning, "max_tokens")
+		require.NotContains(t, request.JSONBody, "reasoning_effort")
 	})
 
 	t.Run("status error makes one request", func(t *testing.T) {

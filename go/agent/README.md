@@ -213,11 +213,11 @@ ag.InstructionsFunc = func(ctx context.Context, rc *agent.RunContext, a *agent.A
 ```
 
 `ModelSettings` tunes requests per agent: `RequestTimeout`, `Temperature`,
-`TopP`, `MaxTokens`, `ParallelToolCalls` (nil pointers are omitted from the
-request), `ToolChoice` (`"auto"`, `"required"`, `"none"`, or a tool name to
-force), and `StructuredOutput`. `RequestTimeout` applies separately to each
-provider attempt; zero uses the client's default and a negative duration
-disables the client timeout.
+`TopP`, `MaxTokens`, `ReasoningTokenBudget`, `ParallelToolCalls` (nil pointers
+are omitted from the request), `ToolChoice` (`"auto"`, `"required"`, `"none"`,
+or a tool name to force), and `StructuredOutput`. `RequestTimeout` applies
+separately to each provider attempt; zero uses the client's default and a
+negative duration disables the client timeout.
 
 `StructuredOutput` requests modern JSON Schema structured output. The client
 does not expose the legacy `json_object` mode and does not validate the model's
@@ -392,9 +392,22 @@ embeddings from different models compatible.
 
 Reasoning models served with a reasoning parser (for example
 `vllm serve ... --reasoning-parser deepseek_r1`) return their thinking in a
-`reasoning_content` field. The runner converts it into an `agent.Reasoning`
-item and never replays reasoning items back to the model when converting
-history into requests.
+`reasoning` field (`reasoning_content` on compatible legacy endpoints). The
+runner converts it into an `agent.Reasoning` item and never replays reasoning
+items back to the model when converting history into requests.
+
+Reasoning is disabled by default. Set a positive per-agent token budget to
+enable it:
+
+```go
+assistant.ModelSettings.ReasoningTokenBudget = 256
+```
+
+The runner copies this value to `llm.ChatRequest.ReasoningTokenBudget` on every
+turn. OpenRouter receives `reasoning.max_tokens`; vLLM receives
+`thinking_token_budget` and an enabled chat template. A non-positive value
+sends each provider's reasoning-off controls. Handoff targets and agents used
+as tools use their own `ModelSettings`.
 
 ## Not ported (yet)
 

@@ -40,6 +40,7 @@ type Client struct {
 	model          string
 	apiKey         string
 	baseURL        string
+	reasoning      reasoningDialect
 	httpClient     *http.Client
 	headers        map[string]string
 	queryParams    map[string]string
@@ -47,6 +48,14 @@ type Client struct {
 	maxRespBody    int64
 	requestTimeout time.Duration
 }
+
+type reasoningDialect uint8
+
+const (
+	reasoningDialectNone reasoningDialect = iota
+	reasoningDialectOpenRouter
+	reasoningDialectVLLM
+)
 
 // Option customizes a Client.
 type Option func(*Client)
@@ -101,6 +110,10 @@ func WithRequestTimeout(timeout time.Duration) Option {
 	return func(c *Client) { c.requestTimeout = timeout }
 }
 
+func withReasoningDialect(dialect reasoningDialect) Option {
+	return func(c *Client) { c.reasoning = dialect }
+}
+
 // NewClient builds a Chat Completions client for model. By default it uses
 // DefaultBaseURL.
 func NewClient(model string, opts ...Option) *Client {
@@ -138,13 +151,9 @@ type VLLMConfig struct {
 	APIKey      string
 	ChatBaseURL string
 	ChatModel   string
-	// ReasoningTokenBudget emits vLLM-specific JSON fields for reasoning
-	// models served with thinking/reasoning chat templates. Nil or negative
-	// leaves reasoning configuration unchanged; zero disables thinking.
-	ReasoningTokenBudget *int
-	Headers              map[string]string
-	QueryParams          map[string]string
-	ExtraFields          map[string]any
+	Headers     map[string]string
+	QueryParams map[string]string
+	ExtraFields map[string]any
 }
 
 // NewVLLM builds a vLLM Chat Completions client. If APIKey is empty, the
@@ -155,12 +164,11 @@ func NewVLLM(cfg VLLMConfig) *Client {
 	if extraFields == nil {
 		extraFields = map[string]any{}
 	}
-	maps.Copy(extraFields, vllmReasoningFields(cfg.ReasoningTokenBudget))
-
 	return NewClient(cfg.ChatModel,
 		WithProviderID(cfg.ProviderID),
 		WithAPIKey(apiKey),
 		WithBaseURL(cfg.ChatBaseURL),
+		withReasoningDialect(reasoningDialectVLLM),
 		WithHeaders(cfg.Headers),
 		WithQueryParams(cfg.QueryParams),
 		WithExtraFields(extraFields),
@@ -207,6 +215,7 @@ func NewOpenRouter(cfg OpenRouterConfig) *Client {
 		WithProviderID(cfg.ProviderID),
 		WithAPIKey(cfg.APIKey),
 		WithBaseURL(baseURL),
+		withReasoningDialect(reasoningDialectOpenRouter),
 		WithHeaders(headers),
 		WithQueryParams(cfg.QueryParams),
 		WithExtraFields(extraFields),
@@ -216,14 +225,18 @@ func NewOpenRouter(cfg OpenRouterConfig) *Client {
 // ChatRequest is an OpenAI-compatible Chat Completions request without the
 // model field. Client injects its configured model into each request.
 type ChatRequest struct {
-	Messages          []ChatMessage     `json:"messages"`
-	Tools             []ChatTool        `json:"tools,omitempty"`
-	Temperature       *float64          `json:"temperature,omitempty"`
-	TopP              *float64          `json:"top_p,omitempty"`
-	MaxTokens         *int              `json:"max_completion_tokens,omitempty"`
-	ParallelToolCalls *bool             `json:"parallel_tool_calls,omitempty"`
-	ToolChoice        any               `json:"tool_choice,omitempty"`
-	StructuredOutput  *StructuredOutput `json:"-"`
+	Messages    []ChatMessage `json:"messages"`
+	Tools       []ChatTool    `json:"tools,omitempty"`
+	Temperature *float64      `json:"temperature,omitempty"`
+	TopP        *float64      `json:"top_p,omitempty"`
+	MaxTokens   *int          `json:"max_completion_tokens,omitempty"`
+	// ReasoningTokenBudget enables reasoning when greater than zero. NewVLLM and
+	// NewOpenRouter translate non-positive values into provider-specific
+	// reasoning-off payloads.
+	ReasoningTokenBudget int               `json:"-"`
+	ParallelToolCalls    *bool             `json:"parallel_tool_calls,omitempty"`
+	ToolChoice           any               `json:"tool_choice,omitempty"`
+	StructuredOutput     *StructuredOutput `json:"-"`
 	// RequestTimeout overrides the client timeout for each provider attempt.
 	// Zero uses the client default; a negative duration disables it.
 	RequestTimeout time.Duration `json:"-"`
@@ -488,7 +501,7 @@ func (c *Client) marshalRequest(req ChatRequest) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if len(c.extraFields) == 0 {
+	if len(c.extraFields) == 0 && c.reasoning == reasoningDialectNone {
 		return body, nil
 	}
 	var payload map[string]any
@@ -497,6 +510,7 @@ func (c *Client) marshalRequest(req ChatRequest) ([]byte, error) {
 	}
 	responseFormat := payload["response_format"]
 	applyExtraFields(payload, c.extraFields)
+	applyReasoning(payload, c.reasoning, req.ReasoningTokenBudget)
 	if responseFormat != nil {
 		payload["response_format"] = responseFormat
 	}
@@ -638,21 +652,34 @@ func setJSONPath(payload map[string]any, path []string, value any) {
 	setJSONPath(next, path[1:], value)
 }
 
-// vllmReasoningFields returns vLLM-specific request body extensions for
-// reasoning-capable local models. These fields are not part of the OpenAI Chat
-// Completions spec; they target vLLM deployments and compatible chat templates
-// that understand thinking_token_budget, chat_template_kwargs, and reasoning.
-func vllmReasoningFields(budget *int) map[string]any {
-	if budget == nil || *budget < 0 {
-		return nil
+func applyReasoning(payload map[string]any, dialect reasoningDialect, budget int) {
+	switch dialect {
+	case reasoningDialectOpenRouter:
+		reasoning, ok := payload["reasoning"].(map[string]any)
+		if !ok {
+			reasoning = map[string]any{}
+		}
+		delete(reasoning, "effort")
+		delete(reasoning, "enabled")
+		delete(reasoning, "max_tokens")
+		switch {
+		case budget > 0:
+			reasoning["max_tokens"] = budget
+		default:
+			reasoning["effort"] = "none"
+		}
+		payload["reasoning"] = reasoning
+		delete(payload, "reasoning_effort")
+	case reasoningDialectVLLM:
+		delete(payload, "reasoning")
+		if budget > 0 {
+			delete(payload, "reasoning_effort")
+			payload["thinking_token_budget"] = budget
+			setJSONPath(payload, []string{"chat_template_kwargs", "enable_thinking"}, true)
+			return
+		}
+		delete(payload, "thinking_token_budget")
+		payload["reasoning_effort"] = "none"
+		setJSONPath(payload, []string{"chat_template_kwargs", "enable_thinking"}, false)
 	}
-	extraFields := map[string]any{"thinking_token_budget": *budget}
-	switch *budget {
-	case 0:
-		extraFields["chat_template_kwargs.enable_thinking"] = false
-		extraFields["reasoning.effort"] = "none"
-	default:
-		extraFields["reasoning.max_tokens"] = *budget
-	}
-	return extraFields
 }
