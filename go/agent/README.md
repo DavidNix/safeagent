@@ -66,7 +66,8 @@ the model, then acts on the response:
 
 ## Tools
 
-A tool is a name, a JSON schema, and a Go function:
+A tool is a name, a JSON schema, and a Go function. Its name is required and
+must be unique across the agent's tools and resolved handoff names:
 
 ```go
 weather := agent.Tool{
@@ -291,8 +292,25 @@ runner := &agent.Runner{
 }
 ```
 
-`SlogTracer` logs run boundaries and handoffs at info, turns, model calls,
-and tool activity at debug, and failures at error.
+`SlogTracer` does not attach raw prompts, responses, reasoning, tool arguments,
+or tool outputs by default. Tool starts are logged at info with the tool name
+and call ID regardless of content capture; turns, model calls, and tool
+completions are logged at debug, and failures at error.
+
+Raw trace content can contain secrets or personal data. Enable it explicitly
+only when the log destination is trusted:
+
+```go
+tracer := agent.NewSlogTracer(slog.Default())
+tracer.IncludeSensitiveData = true
+
+runner := &agent.Runner{Tracer: tracer}
+```
+
+When enabled, run input, complete model requests and responses (including
+assistant replies and reasoning), tool arguments, raw tool outputs, and final
+output are attached to their lifecycle events. Configure the flag before
+starting a run; a tracer may be called concurrently for parallel tools.
 
 ## Custom models and testing
 

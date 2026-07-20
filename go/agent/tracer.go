@@ -57,11 +57,14 @@ func (NoopTracer) Handoff(context.Context, *Agent, *Agent) {}
 // RunEnded implements Tracer.
 func (NoopTracer) RunEnded(context.Context, *RunResult, error) {}
 
-// SlogTracer logs run lifecycle events to a slog.Logger: run boundaries and
-// handoffs at info, turns, model calls, and tool activity at debug, and
-// failures at error.
+// SlogTracer logs run lifecycle events to a slog.Logger: run boundaries,
+// handoffs, and tool starts at info, turns, model calls, and tool completions
+// at debug, and failures at error.
 type SlogTracer struct {
-	logger *slog.Logger
+	// IncludeSensitiveData enables logging prompts, model responses, reasoning,
+	// tool arguments, and tool outputs. Configure it before starting a run.
+	IncludeSensitiveData bool
+	logger               *slog.Logger
 }
 
 // NewSlogTracer builds a SlogTracer that logs to logger. The logger must not
@@ -72,7 +75,11 @@ func NewSlogTracer(logger *slog.Logger) *SlogTracer {
 
 // RunStarted implements Tracer.
 func (t *SlogTracer) RunStarted(ctx context.Context, agent *Agent, input []Item) {
-	t.logger.InfoContext(ctx, "Run started", "agent", agent.Name, "input_items", len(input))
+	attrs := []any{"agent", agent.Name, "input_items", len(input)}
+	if t.IncludeSensitiveData {
+		attrs = append(attrs, "input", input)
+	}
+	t.logger.InfoContext(ctx, "Run started", attrs...)
 }
 
 // TurnStarted implements Tracer.
@@ -81,31 +88,46 @@ func (t *SlogTracer) TurnStarted(ctx context.Context, agent *Agent, turn int) {
 }
 
 // ModelCallEnded implements Tracer.
-func (t *SlogTracer) ModelCallEnded(ctx context.Context, agent *Agent, _ llm.ChatRequest, resp *llm.ChatResponse, err error) {
+func (t *SlogTracer) ModelCallEnded(ctx context.Context, agent *Agent, req llm.ChatRequest, resp *llm.ChatResponse, err error) {
+	attrs := []any{"agent", agent.Name}
+	if t.IncludeSensitiveData {
+		attrs = append(attrs, "request", req, "response", resp)
+	}
 	if err != nil {
-		t.logger.ErrorContext(ctx, "Model call failed", "agent", agent.Name, "error", err)
+		attrs = append(attrs, "error", err)
+		t.logger.ErrorContext(ctx, "Model call failed", attrs...)
 		return
 	}
-	t.logger.DebugContext(ctx, "Model call completed",
-		"agent", agent.Name,
+	attrs = append(attrs,
 		"choices", len(resp.Choices),
 		"input_tokens", resp.Usage.PromptTokens,
 		"output_tokens", resp.Usage.CompletionTokens,
 	)
+	t.logger.DebugContext(ctx, "Model call completed", attrs...)
 }
 
 // ToolStarted implements Tracer.
 func (t *SlogTracer) ToolStarted(ctx context.Context, agent *Agent, call ToolCall) {
-	t.logger.DebugContext(ctx, "Tool started", "agent", agent.Name, "tool", call.Name, "call_id", call.ID)
+	attrs := []any{"agent", agent.Name, "tool", call.Name, "call_id", call.ID}
+	if t.IncludeSensitiveData {
+		attrs = append(attrs, "arguments", call.Arguments)
+	}
+	t.logger.InfoContext(ctx, "Tool started", attrs...)
 }
 
 // ToolEnded implements Tracer.
 func (t *SlogTracer) ToolEnded(ctx context.Context, agent *Agent, call ToolCall, output string, err error) {
+	attrs := []any{"agent", agent.Name, "tool", call.Name, "call_id", call.ID}
+	if t.IncludeSensitiveData {
+		attrs = append(attrs, "output", output)
+	}
 	if err != nil {
-		t.logger.ErrorContext(ctx, "Tool failed", "agent", agent.Name, "tool", call.Name, "call_id", call.ID, "error", err)
+		attrs = append(attrs, "error", err)
+		t.logger.ErrorContext(ctx, "Tool failed", attrs...)
 		return
 	}
-	t.logger.DebugContext(ctx, "Tool completed", "agent", agent.Name, "tool", call.Name, "call_id", call.ID, "output_bytes", len(output))
+	attrs = append(attrs, "output_bytes", len(output))
+	t.logger.DebugContext(ctx, "Tool completed", attrs...)
 }
 
 // Handoff implements Tracer.
@@ -116,13 +138,21 @@ func (t *SlogTracer) Handoff(ctx context.Context, from *Agent, to *Agent) {
 // RunEnded implements Tracer.
 func (t *SlogTracer) RunEnded(ctx context.Context, result *RunResult, err error) {
 	if err != nil {
-		t.logger.ErrorContext(ctx, "Run failed", "error", err)
+		attrs := []any{"error", err}
+		if t.IncludeSensitiveData && result != nil {
+			attrs = append(attrs, "final_output", result.FinalOutput)
+		}
+		t.logger.ErrorContext(ctx, "Run failed", attrs...)
 		return
 	}
-	t.logger.InfoContext(ctx, "Run completed",
+	attrs := []any{
 		"agent", result.LastAgent.Name,
 		"new_items", len(result.NewItems),
 		"requests", result.Usage.Requests,
 		"total_tokens", result.Usage.TotalTokens,
-	)
+	}
+	if t.IncludeSensitiveData {
+		attrs = append(attrs, "final_output", result.FinalOutput)
+	}
+	t.logger.InfoContext(ctx, "Run completed", attrs...)
 }

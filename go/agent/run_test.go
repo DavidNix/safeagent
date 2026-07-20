@@ -833,11 +833,17 @@ func TestRunner_Run(t *testing.T) {
 
 	t.Run("invalid agent configuration", func(t *testing.T) {
 		model := &fakeModel{responses: []fakeModelResponse{{Output: []agent.Item{agent.AssistantMessage("unused")}}}}
+		emptyNameTool := loopTool()
+		emptyNameTool.Name = ""
+		blankNameTool := loopTool()
+		blankNameTool.Name = " \t"
 		tests := []struct {
 			name string
 			ag   *agent.Agent
 			err  string
 		}{
+			{name: "empty tool name", ag: &agent.Agent{Name: "assistant", Model: model, Tools: []agent.Tool{emptyNameTool}}, err: `agent "assistant" has tool with empty name`},
+			{name: "blank tool name", ag: &agent.Agent{Name: "assistant", Model: model, Tools: []agent.Tool{blankNameTool}}, err: `agent "assistant" has tool with empty name`},
 			{name: "nil tool callback", ag: &agent.Agent{Name: "assistant", Model: model, Tools: []agent.Tool{{Name: "broken"}}}, err: `agent "assistant" tool "broken" has no OnInvoke callback`},
 			{name: "nil input guardrail callback", ag: &agent.Agent{Name: "assistant", Model: model, InputGuardrails: []agent.InputGuardrail{{Name: "broken"}}}, err: `agent "assistant" input guardrail "broken" has no Execute callback`},
 			{name: "nil output guardrail callback", ag: &agent.Agent{Name: "assistant", Model: model, OutputGuardrails: []agent.OutputGuardrail{{Name: "broken"}}}, err: `agent "assistant" output guardrail "broken" has no Execute callback`},
@@ -1109,23 +1115,40 @@ func (t *recordingTracer) RunEnded(_ context.Context, _ *agent.RunResult, err er
 func TestSlogTracer(t *testing.T) {
 	t.Parallel()
 
-	t.Run("happy path", func(t *testing.T) {
-		var buf bytes.Buffer
-		logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
-		model := &fakeModel{responses: []fakeModelResponse{
-			{Output: []agent.Item{agent.ToolCall{ID: "call_1", Name: "loop", Arguments: "{}"}}},
-			{Output: []agent.Item{agent.AssistantMessage("done")}, Usage: agent.Usage{Requests: 1, TotalTokens: 9}},
-		}}
-		ag := &agent.Agent{Name: "assistant", Model: model, Tools: []agent.Tool{loopTool()}}
-
-		runner := &agent.Runner{Tracer: agent.NewSlogTracer(logger)}
-		_, err := runner.Run(t.Context(), ag, "go")
-
-		require.NoError(t, err)
-		logged := buf.String()
+	t.Run("safe metadata by default", func(t *testing.T) {
+		logged := runSlogTrace(t, false, slog.LevelDebug)
 		for _, want := range []string{"Run started", "Turn started", "Model call completed", "Tool started", "Tool completed", "Run completed"} {
 			require.True(t, strings.Contains(logged, want), "missing %q in logs:\n%s", want, logged)
 		}
+		for _, want := range []string{"tool=inspect", "call_id=call_1"} {
+			require.Contains(t, logged, want)
+		}
+		for _, secret := range []string{"instruction-secret", "user-secret", "thinking-secret", "argument-secret", "output-secret", "reply-secret"} {
+			require.NotContains(t, logged, secret)
+		}
+	})
+
+	t.Run("sensitive data enabled", func(t *testing.T) {
+		logged := runSlogTrace(t, true, slog.LevelDebug)
+		for _, want := range []string{
+			"instruction-secret",
+			"user-secret",
+			"thinking-secret",
+			"argument-secret",
+			"output-secret",
+			"reply-secret",
+			"tool=inspect",
+			"call_id=call_1",
+		} {
+			require.Contains(t, logged, want)
+		}
+	})
+
+	t.Run("tool identity is logged at info", func(t *testing.T) {
+		logged := runSlogTrace(t, false, slog.LevelInfo)
+		require.Contains(t, logged, `msg="Tool started"`)
+		require.Contains(t, logged, "tool=inspect")
+		require.Contains(t, logged, "call_id=call_1")
 	})
 
 	t.Run("run error", func(t *testing.T) {
@@ -1140,4 +1163,33 @@ func TestSlogTracer(t *testing.T) {
 		require.Contains(t, buf.String(), "Model call failed")
 		require.Contains(t, buf.String(), "Run failed")
 	})
+}
+
+func runSlogTrace(t *testing.T, includeSensitiveData bool, level slog.Leveler) string {
+	t.Helper()
+
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: level}))
+	model := &fakeModel{responses: []fakeModelResponse{
+		{Output: []agent.Item{
+			agent.Reasoning{Content: "thinking-secret"},
+			agent.ToolCall{ID: "call_1", Name: "inspect", Arguments: `{"value":"argument-secret"}`},
+		}},
+		{Output: []agent.Item{agent.AssistantMessage("reply-secret")}, Usage: agent.Usage{Requests: 1, TotalTokens: 9}},
+	}}
+	tool := agent.Tool{
+		Name: "inspect",
+		OnInvoke: func(_ context.Context, _ *agent.RunContext, _ string) (string, error) {
+			return "output-secret", nil
+		},
+	}
+	ag := &agent.Agent{Name: "assistant", Instructions: "instruction-secret", Model: model, Tools: []agent.Tool{tool}}
+	tracer := agent.NewSlogTracer(logger)
+	tracer.IncludeSensitiveData = includeSensitiveData
+	runner := &agent.Runner{Tracer: tracer}
+
+	_, err := runner.Run(t.Context(), ag, "user-secret")
+
+	require.NoError(t, err)
+	return buf.String()
 }

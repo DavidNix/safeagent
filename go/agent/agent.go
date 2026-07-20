@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 )
 
 // Agent is a configured LLM agent: instructions, a model, and the tools,
@@ -117,6 +118,9 @@ func (a *Agent) validate() error {
 
 	functionNames := make(map[string]struct{}, len(a.Tools)+len(a.Handoffs))
 	for _, tool := range a.Tools {
+		if strings.TrimSpace(tool.Name) == "" {
+			return &UserError{Message: fmt.Sprintf("agent %q has tool with empty name", a.Name)}
+		}
 		if tool.OnInvoke == nil {
 			return &UserError{Message: fmt.Sprintf("agent %q tool %q has no OnInvoke callback", a.Name, tool.Name)}
 		}

@@ -8,7 +8,8 @@ import (
 
 // Tool is a function tool the model can invoke during a run.
 type Tool struct {
-	// Name uniquely identifies the tool within an agent.
+	// Name uniquely identifies the tool within an agent's tools and handoffs.
+	// It must not be empty.
 	Name string
 	// Description tells the model when to use the tool.
 	Description string
