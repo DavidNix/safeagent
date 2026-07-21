@@ -1123,7 +1123,7 @@ func TestSlogTracer(t *testing.T) {
 		for _, want := range []string{"tool=inspect", "call_id=call_1"} {
 			require.Contains(t, logged, want)
 		}
-		for _, secret := range []string{"instruction-secret", "user-secret", "thinking-secret", "argument-secret", "output-secret", "reply-secret"} {
+		for _, secret := range []string{"instruction-secret", "user-secret", "history-assistant-secret", "thinking-secret", "working-secret", "argument-secret", "output-secret", "reply-secret"} {
 			require.NotContains(t, logged, secret)
 		}
 	})
@@ -1131,17 +1131,111 @@ func TestSlogTracer(t *testing.T) {
 	t.Run("sensitive data enabled", func(t *testing.T) {
 		logged := runSlogTrace(t, true, slog.LevelDebug)
 		for _, want := range []string{
-			"instruction-secret",
-			"user-secret",
-			"thinking-secret",
 			"argument-secret",
 			"output-secret",
+			"assistant_message=working-secret",
+			"assistant_message=reply-secret",
+			"reasoning=thinking-secret",
+			"working-secret",
 			"reply-secret",
 			"tool=inspect",
 			"call_id=call_1",
 		} {
 			require.Contains(t, logged, want)
 		}
+		for _, secret := range []string{"instruction-secret", "user-secret", "history-assistant-secret"} {
+			require.NotContains(t, logged, secret)
+		}
+		for _, attr := range []string{" input=", " request=", " response=", " final_output="} {
+			require.NotContains(t, logged, attr)
+		}
+		for _, value := range []string{"argument-secret", "output-secret", "thinking-secret", "working-secret", "reply-secret"} {
+			require.Equal(t, 1, strings.Count(logged, value), "expected %q to be logged once:\n%s", value, logged)
+		}
+	})
+
+	t.Run("empty assistant content", func(t *testing.T) {
+		var buf bytes.Buffer
+		logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+		model := &fakeModel{responses: []fakeModelResponse{
+			{Output: []agent.Item{agent.ToolCall{ID: "call_1", Name: "loop", Arguments: "{}"}}},
+			{Output: []agent.Item{agent.AssistantMessage("done")}},
+		}}
+		ag := &agent.Agent{Name: "assistant", Model: model, Tools: []agent.Tool{loopTool()}}
+		tracer := agent.NewSlogTracer(logger)
+		tracer.IncludeSensitiveData = true
+
+		_, err := (&agent.Runner{Tracer: tracer}).Run(t.Context(), ag, "go")
+
+		require.NoError(t, err)
+		require.Contains(t, buf.String(), `assistant_message="[no assistant message]"`)
+	})
+
+	t.Run("configured content limit", func(t *testing.T) {
+		var buf bytes.Buffer
+		logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+		model := &fakeModel{responses: []fakeModelResponse{
+			{Output: []agent.Item{
+				agent.Reasoning{Content: "éééé"},
+				agent.ToolCall{ID: "call_1", Name: "inspect", Arguments: "{}"},
+			}},
+			{Output: []agent.Item{agent.AssistantMessage("éééé")}},
+		}}
+		tool := agent.Tool{
+			Name: "inspect",
+			OnInvoke: func(_ context.Context, _ *agent.RunContext, _ string) (string, error) {
+				return "abcdefgh", nil
+			},
+		}
+		ag := &agent.Agent{Name: "assistant", Model: model, Tools: []agent.Tool{tool}}
+		tracer := agent.NewSlogTracer(logger)
+		tracer.IncludeSensitiveData = true
+		tracer.MaxContentBytes = 5
+
+		_, err := (&agent.Runner{Tracer: tracer}).Run(t.Context(), ag, "go")
+
+		require.NoError(t, err)
+		logged := buf.String()
+		require.Contains(t, logged, "reasoning=éé reasoning_truncated=true")
+		require.Contains(t, logged, "output=abcde output_truncated=true")
+		require.Contains(t, logged, "output_bytes=8")
+		require.Contains(t, logged, "assistant_message=éé assistant_message_truncated=true")
+		require.NotContains(t, logged, "ééé")
+	})
+
+	t.Run("default content limit", func(t *testing.T) {
+		var buf bytes.Buffer
+		logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+		content := strings.Repeat("x", agent.DefaultSlogTracerMaxContentBytes+1)
+		model := &fakeModel{responses: []fakeModelResponse{{Output: []agent.Item{agent.AssistantMessage(content)}}}}
+		ag := &agent.Agent{Name: "assistant", Model: model}
+		tracer := agent.NewSlogTracer(logger)
+		tracer.IncludeSensitiveData = true
+
+		_, err := (&agent.Runner{Tracer: tracer}).Run(t.Context(), ag, "go")
+
+		require.NoError(t, err)
+		logged := buf.String()
+		require.Contains(t, logged, "assistant_message="+strings.Repeat("x", agent.DefaultSlogTracerMaxContentBytes)+" assistant_message_truncated=true")
+		require.NotContains(t, logged, content)
+	})
+
+	t.Run("zero content limit disables truncation", func(t *testing.T) {
+		var buf bytes.Buffer
+		logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+		content := strings.Repeat("x", agent.DefaultSlogTracerMaxContentBytes+1)
+		model := &fakeModel{responses: []fakeModelResponse{{Output: []agent.Item{agent.AssistantMessage(content)}}}}
+		ag := &agent.Agent{Name: "assistant", Model: model}
+		tracer := agent.NewSlogTracer(logger)
+		tracer.IncludeSensitiveData = true
+		tracer.MaxContentBytes = 0
+
+		_, err := (&agent.Runner{Tracer: tracer}).Run(t.Context(), ag, "go")
+
+		require.NoError(t, err)
+		logged := buf.String()
+		require.Contains(t, logged, "assistant_message="+content)
+		require.NotContains(t, logged, "assistant_message_truncated")
 	})
 
 	t.Run("tool identity is logged at info", func(t *testing.T) {
@@ -1173,6 +1267,7 @@ func runSlogTrace(t *testing.T, includeSensitiveData bool, level slog.Leveler) s
 	model := &fakeModel{responses: []fakeModelResponse{
 		{Output: []agent.Item{
 			agent.Reasoning{Content: "thinking-secret"},
+			agent.AssistantMessage("working-secret"),
 			agent.ToolCall{ID: "call_1", Name: "inspect", Arguments: `{"value":"argument-secret"}`},
 		}},
 		{Output: []agent.Item{agent.AssistantMessage("reply-secret")}, Usage: agent.Usage{Requests: 1, TotalTokens: 9}},
@@ -1188,7 +1283,11 @@ func runSlogTrace(t *testing.T, includeSensitiveData bool, level slog.Leveler) s
 	tracer.IncludeSensitiveData = includeSensitiveData
 	runner := &agent.Runner{Tracer: tracer}
 
-	_, err := runner.Run(t.Context(), ag, "user-secret")
+	_, err := runner.RunItems(t.Context(), ag, []agent.Item{
+		agent.UserMessage("user-secret"),
+		agent.AssistantMessage("history-assistant-secret"),
+		agent.UserMessage("continue"),
+	})
 
 	require.NoError(t, err)
 	return buf.String()

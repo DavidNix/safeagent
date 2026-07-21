@@ -292,10 +292,10 @@ runner := &agent.Runner{
 }
 ```
 
-`SlogTracer` does not attach raw prompts, responses, reasoning, tool arguments,
-or tool outputs by default. Tool starts are logged at info with the tool name
-and call ID regardless of content capture; turns, model calls, and tool
-completions are logged at debug, and failures at error.
+`SlogTracer` does not attach assistant messages, reasoning traces, tool
+arguments, or tool outputs by default. Tool starts are logged at info with the
+tool name and call ID regardless of content capture; turns, model calls, and
+tool completions are logged at debug, and failures at error.
 
 Raw trace content can contain secrets or personal data. Enable it explicitly
 only when the log destination is trusted:
@@ -303,14 +303,20 @@ only when the log destination is trusted:
 ```go
 tracer := agent.NewSlogTracer(slog.Default())
 tracer.IncludeSensitiveData = true
+tracer.MaxContentBytes = 8 << 10 // Optional; the default is 4 KiB.
 
 runner := &agent.Runner{Tracer: tracer}
 ```
 
-When enabled, run input, complete model requests and responses (including
-assistant replies and reasoning), tool arguments, raw tool outputs, and final
-output are attached to their lifecycle events. Configure the flag before
-starting a run; a tracer may be called concurrently for parallel tools.
+When enabled, each newly generated assistant message and reasoning trace, tool
+arguments, and raw tool output are attached to their lifecycle events. An
+empty or absent assistant message is logged as `[no assistant message]`.
+Assistant messages, reasoning traces, and tool outputs are truncated to
+`MaxContentBytes` without splitting UTF-8; truncated fields include a matching
+`*_truncated=true` attribute. Set the limit to zero or a negative value to
+disable truncation. Run input, model request history, and complete model
+responses are never attached. Configure these fields before starting a run; a
+tracer may be called concurrently for parallel tools.
 
 ## Custom models and testing
 

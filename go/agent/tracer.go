@@ -3,8 +3,16 @@ package agent
 import (
 	"context"
 	"log/slog"
+	"unicode/utf8"
 
 	"github.com/DavidNix/safeagent/go/llm"
+)
+
+const (
+	// DefaultSlogTracerMaxContentBytes limits each logged assistant message,
+	// reasoning trace, and tool output to 4 KiB.
+	DefaultSlogTracerMaxContentBytes = 4 << 10
+	noAssistantMessage               = "[no assistant message]"
 )
 
 // Tracer observes the lifecycle of agent runs. Inject one via Runner.Tracer;
@@ -61,25 +69,36 @@ func (NoopTracer) RunEnded(context.Context, *RunResult, error) {}
 // handoffs, and tool starts at info, turns, model calls, and tool completions
 // at debug, and failures at error.
 type SlogTracer struct {
-	// IncludeSensitiveData enables logging prompts, model responses, reasoning,
-	// tool arguments, and tool outputs. Configure it before starting a run.
+	// IncludeSensitiveData enables logging newly generated assistant messages,
+	// reasoning traces, tool arguments, and tool outputs. Configure it before
+	// starting a run.
 	IncludeSensitiveData bool
-	logger               *slog.Logger
+	// MaxContentBytes limits each logged assistant message, reasoning trace,
+	// and tool output. Zero or a negative value disables truncation.
+	MaxContentBytes int
+	logger          *slog.Logger
 }
 
 // NewSlogTracer builds a SlogTracer that logs to logger. The logger must not
 // be nil.
 func NewSlogTracer(logger *slog.Logger) *SlogTracer {
-	return &SlogTracer{logger: logger}
+	return &SlogTracer{logger: logger, MaxContentBytes: DefaultSlogTracerMaxContentBytes}
+}
+
+func appendContent(attrs []any, key, content string, maxBytes int) []any {
+	if maxBytes <= 0 || len(content) <= maxBytes {
+		return append(attrs, key, content)
+	}
+	end := maxBytes
+	for end > 0 && !utf8.RuneStart(content[end]) {
+		end--
+	}
+	return append(attrs, key, content[:end], key+"_truncated", true)
 }
 
 // RunStarted implements Tracer.
 func (t *SlogTracer) RunStarted(ctx context.Context, agent *Agent, input []Item) {
-	attrs := []any{"agent", agent.Name, "input_items", len(input)}
-	if t.IncludeSensitiveData {
-		attrs = append(attrs, "input", input)
-	}
-	t.logger.InfoContext(ctx, "Run started", attrs...)
+	t.logger.InfoContext(ctx, "Run started", "agent", agent.Name, "input_items", len(input))
 }
 
 // TurnStarted implements Tracer.
@@ -88,10 +107,20 @@ func (t *SlogTracer) TurnStarted(ctx context.Context, agent *Agent, turn int) {
 }
 
 // ModelCallEnded implements Tracer.
-func (t *SlogTracer) ModelCallEnded(ctx context.Context, agent *Agent, req llm.ChatRequest, resp *llm.ChatResponse, err error) {
+func (t *SlogTracer) ModelCallEnded(ctx context.Context, agent *Agent, _ llm.ChatRequest, resp *llm.ChatResponse, err error) {
 	attrs := []any{"agent", agent.Name}
 	if t.IncludeSensitiveData {
-		attrs = append(attrs, "request", req, "response", resp)
+		switch {
+		case resp == nil || len(resp.Choices) == 0:
+			attrs = append(attrs, "assistant_message", noAssistantMessage)
+		case resp.Choices[0].Message.Content == "":
+			attrs = append(attrs, "assistant_message", noAssistantMessage)
+		default:
+			attrs = appendContent(attrs, "assistant_message", resp.Choices[0].Message.Content, t.MaxContentBytes)
+		}
+		if resp != nil && len(resp.Choices) > 0 && resp.Choices[0].Message.ReasoningContent != "" {
+			attrs = appendContent(attrs, "reasoning", resp.Choices[0].Message.ReasoningContent, t.MaxContentBytes)
+		}
 	}
 	if err != nil {
 		attrs = append(attrs, "error", err)
@@ -119,7 +148,7 @@ func (t *SlogTracer) ToolStarted(ctx context.Context, agent *Agent, call ToolCal
 func (t *SlogTracer) ToolEnded(ctx context.Context, agent *Agent, call ToolCall, output string, err error) {
 	attrs := []any{"agent", agent.Name, "tool", call.Name, "call_id", call.ID}
 	if t.IncludeSensitiveData {
-		attrs = append(attrs, "output", output)
+		attrs = appendContent(attrs, "output", output, t.MaxContentBytes)
 	}
 	if err != nil {
 		attrs = append(attrs, "error", err)
@@ -138,21 +167,13 @@ func (t *SlogTracer) Handoff(ctx context.Context, from *Agent, to *Agent) {
 // RunEnded implements Tracer.
 func (t *SlogTracer) RunEnded(ctx context.Context, result *RunResult, err error) {
 	if err != nil {
-		attrs := []any{"error", err}
-		if t.IncludeSensitiveData && result != nil {
-			attrs = append(attrs, "final_output", result.FinalOutput)
-		}
-		t.logger.ErrorContext(ctx, "Run failed", attrs...)
+		t.logger.ErrorContext(ctx, "Run failed", "error", err)
 		return
 	}
-	attrs := []any{
+	t.logger.InfoContext(ctx, "Run completed",
 		"agent", result.LastAgent.Name,
 		"new_items", len(result.NewItems),
 		"requests", result.Usage.Requests,
 		"total_tokens", result.Usage.TotalTokens,
-	}
-	if t.IncludeSensitiveData {
-		attrs = append(attrs, "final_output", result.FinalOutput)
-	}
-	t.logger.InfoContext(ctx, "Run completed", attrs...)
+	)
 }
