@@ -208,6 +208,28 @@ func TestCircuitBreaker_Complete(t *testing.T) {
 		require.Equal(t, "fallback", fallbackRequest.JSONBody["model"])
 	})
 
+	t.Run("primary exhausts configured retries before failover", func(t *testing.T) {
+		var primaryHits atomic.Int32
+		primaryServer := chatCompletionServer(t, http.StatusServiceUnavailable, "", nil, &primaryHits)
+		t.Cleanup(primaryServer.Close)
+		var fallbackHits atomic.Int32
+		fallbackServer := chatCompletionServer(t, http.StatusOK, "fallback", nil, &fallbackHits)
+		t.Cleanup(fallbackServer.Close)
+		primary := llm.NewClient("primary",
+			llm.WithBaseURL(primaryServer.URL),
+			llm.WithRetry(llm.RetryConfig{Attempts: 2, Delay: time.Nanosecond, DelayType: llm.FixedDelay}),
+		)
+		fallback := llm.NewClient("fallback", llm.WithBaseURL(fallbackServer.URL))
+		breaker := llm.NewCircuitBreaker(primary, fallback)
+
+		resp, err := breaker.Complete(t.Context(), llm.ChatRequest{})
+
+		require.NoError(t, err)
+		require.Equal(t, "fallback", resp.Choices[0].Message.Content)
+		require.Equal(t, int32(2), primaryHits.Load())
+		require.Equal(t, int32(1), fallbackHits.Load())
+	})
+
 	t.Run("e2e primary failure falls back to vllm", func(t *testing.T) {
 		skipE2EInShortMode(t)
 		apiKey := requireE2EEnv(t, openRouterAPIKeyEnv)

@@ -104,6 +104,53 @@ func TestEmbeddingClient_Embed(t *testing.T) {
 		require.Equal(t, "openrouter-fallback", event.ToProvider)
 	})
 
+	t.Run("provider retry configs recover from transient errors", func(t *testing.T) {
+		tests := []struct {
+			name      string
+			newClient func(string) *llm.EmbeddingClient
+		}{
+			{
+				name: "vllm",
+				newClient: func(baseURL string) *llm.EmbeddingClient {
+					return llm.NewVLLMEmbedding(llm.VLLMEmbeddingConfig{
+						BaseURL: baseURL,
+						Model:   "vllm-embed",
+						Retry:   llm.RetryConfig{Attempts: 2, Delay: time.Nanosecond, DelayType: llm.FixedDelay},
+					})
+				},
+			},
+			{
+				name: "openrouter",
+				newClient: func(baseURL string) *llm.EmbeddingClient {
+					return llm.NewOpenRouterEmbedding(llm.OpenRouterEmbeddingConfig{
+						BaseURL: baseURL,
+						Model:   "openrouter-embed",
+						Retry:   llm.RetryConfig{Attempts: 2, Delay: time.Nanosecond, DelayType: llm.FixedDelay},
+					})
+				},
+			},
+		}
+		for _, test := range tests {
+			t.Run(test.name, func(t *testing.T) {
+				var attempts atomic.Int32
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+					if attempts.Add(1) == 1 {
+						w.WriteHeader(http.StatusServiceUnavailable)
+						return
+					}
+					writeEmbeddingResponse(w)
+				}))
+				t.Cleanup(server.Close)
+
+				resp, err := test.newClient(server.URL).Embed(t.Context(), llm.EmbeddingRequest{Input: []string{"first", "second"}})
+
+				require.NoError(t, err)
+				require.Len(t, resp.Data, 2)
+				require.Equal(t, int32(2), attempts.Load())
+			})
+		}
+	})
+
 	t.Run("e2e vllm embedding client", func(t *testing.T) {
 		skipE2EInShortMode(t)
 		baseURL := requireE2EEnv(t, vllmEmbeddingBaseURLEnv)
@@ -131,6 +178,43 @@ func TestEmbeddingClient_Embed(t *testing.T) {
 		require.Equal(t, int32(1), hits.Load())
 		var statusErr *llm.StatusError
 		require.ErrorAs(t, err, &statusErr)
+	})
+
+	t.Run("configured attempts recover from transient status errors", func(t *testing.T) {
+		var attempts atomic.Int32
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			if attempts.Add(1) == 1 {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				return
+			}
+			writeEmbeddingResponse(w)
+		}))
+		t.Cleanup(server.Close)
+		client := llm.NewEmbeddingClient(llm.EmbeddingConfig{Model: "embed-test"},
+			llm.WithBaseURL(server.URL),
+			llm.WithRetry(llm.RetryConfig{Attempts: 2, Delay: time.Nanosecond, DelayType: llm.FixedDelay}),
+		)
+
+		resp, err := client.Embed(t.Context(), llm.EmbeddingRequest{Input: []string{"first", "second"}})
+
+		require.NoError(t, err)
+		require.Len(t, resp.Data, 2)
+		require.Equal(t, int32(2), attempts.Load())
+	})
+
+	t.Run("configured retries skip permanent status errors", func(t *testing.T) {
+		var attempts atomic.Int32
+		server := embeddingServer(t, http.StatusBadRequest, nil, &attempts)
+		t.Cleanup(server.Close)
+		client := llm.NewEmbeddingClient(llm.EmbeddingConfig{Model: "embed-test"},
+			llm.WithBaseURL(server.URL),
+			llm.WithRetry(llm.RetryConfig{Attempts: 3, DelayType: llm.FixedDelay}),
+		)
+
+		_, err := client.Embed(t.Context(), llm.EmbeddingRequest{Input: []string{"hello"}})
+
+		require.EqualError(t, err, "embeddings returned status 400: bad embeddings request")
+		require.Equal(t, int32(1), attempts.Load())
 	})
 
 	t.Run("wrong response dimensions are rejected", func(t *testing.T) {
@@ -459,6 +543,28 @@ func TestEmbeddingCircuitBreaker_Embed(t *testing.T) {
 		require.Equal(t, "fallback", fallbackRequest.JSONBody["model"])
 		require.Equal(t, []any{"hello", "world"}, fallbackRequest.JSONBody["input"])
 		require.InDelta(t, 2, fallbackRequest.JSONBody["dimensions"], 0.0001)
+	})
+
+	t.Run("primary exhausts configured retries before failover", func(t *testing.T) {
+		var primaryHits atomic.Int32
+		primaryServer := embeddingServer(t, http.StatusServiceUnavailable, nil, &primaryHits)
+		t.Cleanup(primaryServer.Close)
+		var fallbackHits atomic.Int32
+		fallbackServer := embeddingServer(t, http.StatusOK, nil, &fallbackHits)
+		t.Cleanup(fallbackServer.Close)
+		primary := llm.NewEmbeddingClient(llm.EmbeddingConfig{Model: "primary"},
+			llm.WithBaseURL(primaryServer.URL),
+			llm.WithRetry(llm.RetryConfig{Attempts: 2, Delay: time.Nanosecond, DelayType: llm.FixedDelay}),
+		)
+		fallback := llm.NewEmbeddingClient(llm.EmbeddingConfig{Model: "fallback"}, llm.WithBaseURL(fallbackServer.URL))
+		breaker := llm.NewEmbeddingCircuitBreaker(primary, fallback)
+
+		resp, err := breaker.Embed(t.Context(), llm.EmbeddingRequest{Input: []string{"first", "second"}})
+
+		require.NoError(t, err)
+		require.Len(t, resp.Data, 2)
+		require.Equal(t, int32(2), primaryHits.Load())
+		require.Equal(t, int32(1), fallbackHits.Load())
 	})
 
 	t.Run("bad request falls back without same-client retry", func(t *testing.T) {

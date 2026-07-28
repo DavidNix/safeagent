@@ -65,8 +65,8 @@ func NewCircuitBreakerWithConfig(cfg BreakerConfig, primary *Client, fallbacks .
 	}
 }
 
-// Complete sends a Chat Completions request. Provider failures immediately
-// fall through to configured fallbacks; each client is attempted once.
+// Complete sends a Chat Completions request. Provider failures fall through to
+// configured fallbacks after the client's configured retries are exhausted.
 func (b *CircuitBreaker) Complete(ctx context.Context, req ChatRequest) (*ChatResponse, error) {
 	body, err := b.primary.prepareChatRequest(ctx, req)
 	if err != nil {

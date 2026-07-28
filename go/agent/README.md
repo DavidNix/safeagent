@@ -337,9 +337,32 @@ in the same way.
 The `llm` package options include `llm.WithBaseURL` (point it at any
 OpenAI-compatible server), `llm.WithAPIKey`, `llm.WithHTTPClient`, static
 headers/query params, and constructor-level JSON extra fields for provider
-extensions. Each client is attempted once and has a 60-second request timeout
-by default. Use `llm.WithRequestTimeout` to change the client default; zero or
-a negative duration disables it.
+extensions. By default, each client is attempted once and has a 60-second
+request timeout. Use `llm.WithRequestTimeout` to change the client default;
+zero or a negative duration disables it.
+
+Retries are also off by default. Enable them on generic clients with
+`llm.WithRetry`, or set the shared `Retry` field on a vLLM or OpenRouter
+configuration. `Attempts` includes the initial request, so values below two
+leave retries disabled:
+
+```go
+client := llm.NewClient("model",
+	llm.WithRetry(llm.RetryConfig{
+		Attempts:  3,
+		Delay:     200 * time.Millisecond,
+		MaxDelay:  2 * time.Second,
+		MaxJitter: 100 * time.Millisecond,
+		DelayType: llm.CombineDelay(llm.BackOffDelay, llm.RandomDelay),
+	}),
+)
+```
+
+When enabled, the default strategy is exponential backoff plus random jitter.
+Retries apply to transport and response-read failures, HTTP 408 and 429, and
+HTTP 5xx responses. Other HTTP 4xx responses and local request, decode,
+validation, and response-size errors return immediately. Exhaustion returns the
+last underlying error without wrapping it in a retry aggregate.
 
 Set `ChatRequest.RequestTimeout` or `EmbeddingRequest.RequestTimeout` to
 override that default for one logical request. A positive duration applies
@@ -361,12 +384,14 @@ attempt's effective limit is the earliest of the caller context deadline, the
 request override or client default, and the custom HTTP timeout.
 
 Wrap clients in `llm.CircuitBreaker` to try configured fallbacks when a request
-fails. Each provider gets a fresh request timeout bounded by the caller's
-context. Caller cancellation, caller expiration, and request serialization
-errors stop the chain immediately. HTTP 400, 412, 422, other unclassified 4xx
-responses, and local response-size limit errors fall back without counting
-against the primary. HTTP 401, 403, 404, 408, 413, 429, 5xx responses, transport
-errors, provider timeouts, and unusable successful responses count against it.
+fails. A client exhausts its own retry budget before the breaker records one
+provider failure and moves to the next client. Each provider attempt gets a
+fresh request timeout bounded by the caller's context. Caller cancellation,
+caller expiration, and request serialization errors stop the chain immediately.
+HTTP 400, 412, 422, other unclassified 4xx responses, and local response-size
+limit errors fall back without counting against the primary. HTTP 401, 403, 404,
+408, 413, 429, 5xx responses, transport errors, provider timeouts, and unusable
+successful responses count against it.
 
 Use `WithProviderID` or the provider configuration's `ProviderID` field with
 `BreakerConfig.OnFailover` to observe errors that cause another provider to be

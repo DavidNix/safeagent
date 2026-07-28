@@ -28,6 +28,7 @@ type VLLMEmbeddingConfig struct {
 	APIKey      string
 	BaseURL     string
 	Model       string
+	Retry       RetryConfig
 	Headers     map[string]string
 	QueryParams map[string]string
 	ExtraFields map[string]any
@@ -41,6 +42,7 @@ func NewVLLMEmbedding(cfg VLLMEmbeddingConfig) *EmbeddingClient {
 		WithProviderID(cfg.ProviderID),
 		WithAPIKey(apiKey),
 		WithBaseURL(cfg.BaseURL),
+		WithRetry(cfg.Retry),
 		WithHeaders(cfg.Headers),
 		WithQueryParams(cfg.QueryParams),
 		WithExtraFields(cfg.ExtraFields),
@@ -53,6 +55,7 @@ type OpenRouterEmbeddingConfig struct {
 	APIKey                   string
 	BaseURL                  string
 	Model                    string
+	Retry                    RetryConfig
 	SiteURL                  string
 	AppTitle                 string
 	RequireZeroDataRetention bool
@@ -86,6 +89,7 @@ func NewOpenRouterEmbedding(cfg OpenRouterEmbeddingConfig) *EmbeddingClient {
 		WithProviderID(cfg.ProviderID),
 		WithAPIKey(cfg.APIKey),
 		WithBaseURL(baseURL),
+		WithRetry(cfg.Retry),
 		WithHeaders(headers),
 		WithQueryParams(cfg.QueryParams),
 		WithExtraFields(extraFields),
@@ -137,7 +141,7 @@ type wireEmbeddingRequest struct {
 	EmbeddingRequest
 }
 
-// Embed creates float-encoded embeddings with one provider request.
+// Embed creates float-encoded embeddings.
 func (c *EmbeddingClient) Embed(ctx context.Context, req EmbeddingRequest) (*EmbeddingResponse, error) {
 	body, err := c.prepareEmbeddingRequest(ctx, req)
 	if err != nil {
@@ -161,10 +165,11 @@ func (c *EmbeddingClient) prepareEmbeddingRequest(ctx context.Context, req Embed
 }
 
 func (c *EmbeddingClient) embed(ctx context.Context, body []byte, req EmbeddingRequest) (*EmbeddingResponse, error) {
-	ctx, cancel := c.client.requestContext(ctx, req.RequestTimeout)
-	defer cancel()
-
-	resp, err := c.roundTrip(ctx, body)
+	resp, err := doWithRetry(ctx, c.client.retry, func() (*EmbeddingResponse, error) {
+		attemptCtx, cancel := c.client.requestContext(ctx, req.RequestTimeout)
+		defer cancel()
+		return c.roundTrip(attemptCtx, body)
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -211,7 +216,7 @@ func (c *EmbeddingClient) roundTrip(ctx context.Context, body []byte) (*Embeddin
 
 	resp, err := c.client.httpClient.Do(httpReq)
 	if err != nil {
-		return nil, fmt.Errorf("call embeddings: %w", err)
+		return nil, transient(fmt.Errorf("call embeddings: %w", err))
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -219,7 +224,7 @@ func (c *EmbeddingClient) roundTrip(ctx context.Context, body []byte) (*Embeddin
 	if resp.StatusCode != http.StatusOK {
 		var tooLarge *ResponseTooLargeError
 		if err != nil && !errors.As(err, &tooLarge) {
-			return nil, fmt.Errorf("read embeddings response: %w", err)
+			return nil, transient(fmt.Errorf("read embeddings response: %w", err))
 		}
 		return nil, &StatusError{
 			StatusCode: resp.StatusCode,
@@ -230,8 +235,9 @@ func (c *EmbeddingClient) roundTrip(ctx context.Context, body []byte) (*Embeddin
 	if err != nil {
 		if tooLarge, ok := errors.AsType[*ResponseTooLargeError](err); ok {
 			tooLarge.operation = "embeddings"
+			return nil, fmt.Errorf("read embeddings response: %w", err)
 		}
-		return nil, fmt.Errorf("read embeddings response: %w", err)
+		return nil, transient(fmt.Errorf("read embeddings response: %w", err))
 	}
 
 	var parsed EmbeddingResponse

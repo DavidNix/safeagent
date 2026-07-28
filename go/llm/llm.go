@@ -47,6 +47,7 @@ type Client struct {
 	extraFields    map[string]any
 	maxRespBody    int64
 	requestTimeout time.Duration
+	retry          *retryConfig
 }
 
 type reasoningDialect uint8
@@ -151,6 +152,7 @@ type VLLMConfig struct {
 	APIKey      string
 	ChatBaseURL string
 	ChatModel   string
+	Retry       RetryConfig
 	Headers     map[string]string
 	QueryParams map[string]string
 	ExtraFields map[string]any
@@ -168,6 +170,7 @@ func NewVLLM(cfg VLLMConfig) *Client {
 		WithProviderID(cfg.ProviderID),
 		WithAPIKey(apiKey),
 		WithBaseURL(cfg.ChatBaseURL),
+		WithRetry(cfg.Retry),
 		withReasoningDialect(reasoningDialectVLLM),
 		WithHeaders(cfg.Headers),
 		WithQueryParams(cfg.QueryParams),
@@ -182,6 +185,7 @@ type OpenRouterConfig struct {
 	APIKey                   string
 	BaseURL                  string
 	ChatModel                string
+	Retry                    RetryConfig
 	SiteURL                  string
 	AppTitle                 string
 	RequireZeroDataRetention bool
@@ -215,6 +219,7 @@ func NewOpenRouter(cfg OpenRouterConfig) *Client {
 		WithProviderID(cfg.ProviderID),
 		WithAPIKey(cfg.APIKey),
 		WithBaseURL(baseURL),
+		WithRetry(cfg.Retry),
 		withReasoningDialect(reasoningDialectOpenRouter),
 		WithHeaders(headers),
 		WithQueryParams(cfg.QueryParams),
@@ -424,7 +429,7 @@ func (e *requestSerializationError) Unwrap() error {
 	return e.err
 }
 
-// Complete sends one Chat Completions request.
+// Complete sends a Chat Completions request.
 func (c *Client) Complete(ctx context.Context, req ChatRequest) (*ChatResponse, error) {
 	body, err := c.prepareChatRequest(ctx, req)
 	if err != nil {
@@ -448,16 +453,23 @@ func (c *Client) prepareChatRequest(ctx context.Context, req ChatRequest) ([]byt
 }
 
 func (c *Client) complete(ctx context.Context, body []byte, requestTimeout time.Duration) (*ChatResponse, error) {
-	ctx, cancel := c.requestContext(ctx, requestTimeout)
-	defer cancel()
-	return c.roundTrip(ctx, body)
+	return doWithRetry(ctx, c.retry, func() (*ChatResponse, error) {
+		attemptCtx, cancel := c.requestContext(ctx, requestTimeout)
+		defer cancel()
+		return c.roundTrip(attemptCtx, body)
+	})
 }
 
 // Models returns the models advertised by the configured OpenAI-compatible API.
 func (c *Client) Models(ctx context.Context) (*ModelsResponse, error) {
-	ctx, cancel := c.requestContext(ctx, 0)
-	defer cancel()
+	return doWithRetry(ctx, c.retry, func() (*ModelsResponse, error) {
+		attemptCtx, cancel := c.requestContext(ctx, 0)
+		defer cancel()
+		return c.models(attemptCtx)
+	})
+}
 
+func (c *Client) models(ctx context.Context) (*ModelsResponse, error) {
 	endpoint, err := c.endpoint("models")
 	if err != nil {
 		return nil, err
@@ -473,13 +485,17 @@ func (c *Client) Models(ctx context.Context) (*ModelsResponse, error) {
 
 	resp, err := c.httpClient.Do(httpReq)
 	if err != nil {
-		return nil, fmt.Errorf("call models: %w", err)
+		return nil, transient(fmt.Errorf("call models: %w", err))
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	respBody, err := readResponseBody(resp.Body, c.maxRespBody)
 	if err != nil {
-		return nil, fmt.Errorf("read models response: %w", err)
+		wrapped := fmt.Errorf("read models response: %w", err)
+		if _, ok := errors.AsType[*ResponseTooLargeError](err); ok {
+			return nil, wrapped
+		}
+		return nil, transient(wrapped)
 	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, &modelsStatusError{StatusCode: resp.StatusCode, Body: string(respBody)}
@@ -534,7 +550,7 @@ func (c *Client) roundTrip(ctx context.Context, body []byte) (*ChatResponse, err
 
 	resp, err := c.httpClient.Do(httpReq)
 	if err != nil {
-		return nil, fmt.Errorf("call chat completions: %w", err)
+		return nil, transient(fmt.Errorf("call chat completions: %w", err))
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -542,7 +558,7 @@ func (c *Client) roundTrip(ctx context.Context, body []byte) (*ChatResponse, err
 	if resp.StatusCode != http.StatusOK {
 		var tooLarge *ResponseTooLargeError
 		if err != nil && !errors.As(err, &tooLarge) {
-			return nil, fmt.Errorf("read chat completions response: %w", err)
+			return nil, transient(fmt.Errorf("read chat completions response: %w", err))
 		}
 		return nil, &StatusError{
 			StatusCode: resp.StatusCode,
@@ -550,7 +566,11 @@ func (c *Client) roundTrip(ctx context.Context, body []byte) (*ChatResponse, err
 		}
 	}
 	if err != nil {
-		return nil, fmt.Errorf("read chat completions response: %w", err)
+		wrapped := fmt.Errorf("read chat completions response: %w", err)
+		if _, ok := errors.AsType[*ResponseTooLargeError](err); ok {
+			return nil, wrapped
+		}
+		return nil, transient(wrapped)
 	}
 
 	var parsed ChatResponse

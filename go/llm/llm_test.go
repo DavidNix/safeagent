@@ -295,6 +295,53 @@ func TestClient_Complete(t *testing.T) {
 		require.Equal(t, "openrouter-fallback", event.ToProvider)
 	})
 
+	t.Run("provider retry configs recover from transient errors", func(t *testing.T) {
+		tests := []struct {
+			name      string
+			newClient func(string) *llm.Client
+		}{
+			{
+				name: "vllm",
+				newClient: func(baseURL string) *llm.Client {
+					return llm.NewVLLM(llm.VLLMConfig{
+						ChatBaseURL: baseURL,
+						ChatModel:   "vllm-chat",
+						Retry:       llm.RetryConfig{Attempts: 2, Delay: time.Nanosecond, DelayType: llm.FixedDelay},
+					})
+				},
+			},
+			{
+				name: "openrouter",
+				newClient: func(baseURL string) *llm.Client {
+					return llm.NewOpenRouter(llm.OpenRouterConfig{
+						BaseURL:   baseURL,
+						ChatModel: "openrouter-chat",
+						Retry:     llm.RetryConfig{Attempts: 2, Delay: time.Nanosecond, DelayType: llm.FixedDelay},
+					})
+				},
+			},
+		}
+		for _, test := range tests {
+			t.Run(test.name, func(t *testing.T) {
+				var attempts atomic.Int32
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+					if attempts.Add(1) == 1 {
+						w.WriteHeader(http.StatusServiceUnavailable)
+						return
+					}
+					writeChatCompletion(w, "recovered")
+				}))
+				t.Cleanup(server.Close)
+
+				resp, err := test.newClient(server.URL).Complete(t.Context(), llm.ChatRequest{})
+
+				require.NoError(t, err)
+				require.Equal(t, "recovered", resp.Choices[0].Message.Content)
+				require.Equal(t, int32(2), attempts.Load())
+			})
+		}
+	})
+
 	t.Run("openrouter zero data retention overrides provider parent field", func(t *testing.T) {
 		var missingZDR atomic.Bool
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -428,6 +475,198 @@ func TestClient_Complete(t *testing.T) {
 
 		require.EqualError(t, err, "chat completions returned status 500")
 		require.Equal(t, int32(1), attempts.Load())
+	})
+
+	t.Run("configured attempts recover from transient status errors", func(t *testing.T) {
+		var attempts atomic.Int32
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			if attempts.Add(1) < 3 {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				return
+			}
+			writeChatCompletion(w, "recovered")
+		}))
+		t.Cleanup(server.Close)
+		client := llm.NewClient("gpt-test",
+			llm.WithBaseURL(server.URL),
+			llm.WithRetry(llm.RetryConfig{Attempts: 3, Delay: time.Nanosecond, DelayType: llm.FixedDelay}),
+		)
+
+		resp, err := client.Complete(t.Context(), llm.ChatRequest{})
+
+		require.NoError(t, err)
+		require.Equal(t, "recovered", resp.Choices[0].Message.Content)
+		require.Equal(t, int32(3), attempts.Load())
+	})
+
+	t.Run("configured retries skip permanent status errors", func(t *testing.T) {
+		for _, status := range []int{
+			http.StatusBadRequest,
+			http.StatusUnauthorized,
+			http.StatusForbidden,
+			http.StatusNotFound,
+			http.StatusRequestEntityTooLarge,
+		} {
+			t.Run(http.StatusText(status), func(t *testing.T) {
+				var attempts atomic.Int32
+				server := chatCompletionServer(t, status, "", nil, &attempts)
+				t.Cleanup(server.Close)
+				client := llm.NewClient("gpt-test",
+					llm.WithBaseURL(server.URL),
+					llm.WithRetry(llm.RetryConfig{Attempts: 3, Delay: -1, DelayType: llm.FixedDelay}),
+				)
+
+				_, err := client.Complete(t.Context(), llm.ChatRequest{})
+
+				require.EqualError(t, err, fmt.Sprintf("chat completions returned status %d", status))
+				require.Equal(t, int32(1), attempts.Load())
+			})
+		}
+	})
+
+	t.Run("configured retries recover from transport errors", func(t *testing.T) {
+		var attempts atomic.Int32
+		client := llm.NewClient("gpt-test",
+			llm.WithRetry(llm.RetryConfig{Attempts: 2, Delay: time.Nanosecond, DelayType: llm.FixedDelay}),
+			llm.WithHTTPClient(&http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+				if attempts.Add(1) == 1 {
+					return nil, errors.New("connection failed")
+				}
+				return testHTTPResponse(http.StatusOK, "recovered"), nil
+			})}),
+		)
+
+		resp, err := client.Complete(t.Context(), llm.ChatRequest{})
+
+		require.NoError(t, err)
+		require.Equal(t, "recovered", resp.Choices[0].Message.Content)
+		require.Equal(t, int32(2), attempts.Load())
+	})
+
+	t.Run("configured retries recover from response read errors", func(t *testing.T) {
+		var attempts atomic.Int32
+		client := llm.NewClient("gpt-test",
+			llm.WithRetry(llm.RetryConfig{Attempts: 2, Delay: time.Nanosecond, DelayType: llm.FixedDelay}),
+			llm.WithHTTPClient(&http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+				if attempts.Add(1) == 1 {
+					return &http.Response{
+						StatusCode: http.StatusOK,
+						Header:     make(http.Header),
+						Body:       readErrorBody{},
+					}, nil
+				}
+				return testHTTPResponse(http.StatusOK, "recovered"), nil
+			})}),
+		)
+
+		resp, err := client.Complete(t.Context(), llm.ChatRequest{})
+
+		require.NoError(t, err)
+		require.Equal(t, "recovered", resp.Choices[0].Message.Content)
+		require.Equal(t, int32(2), attempts.Load())
+	})
+
+	t.Run("enabled retry defaults use backoff without a maximum delay", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			var attempts atomic.Int32
+			client := llm.NewClient("gpt-test",
+				llm.WithRetry(llm.RetryConfig{Attempts: 2, MaxJitter: -1}),
+				llm.WithHTTPClient(&http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+					if attempts.Add(1) == 1 {
+						return testHTTPResponse(http.StatusServiceUnavailable, ""), nil
+					}
+					return testHTTPResponse(http.StatusOK, "recovered"), nil
+				})}),
+			)
+			start := time.Now()
+
+			resp, err := client.Complete(t.Context(), llm.ChatRequest{})
+
+			require.NoError(t, err)
+			require.Equal(t, "recovered", resp.Choices[0].Message.Content)
+			require.Equal(t, llm.DefaultRetryDelay, time.Since(start))
+		})
+	})
+
+	t.Run("delay strategy and maximum delay control retry wait", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			var attempts atomic.Int32
+			client := llm.NewClient("gpt-test",
+				llm.WithRetry(llm.RetryConfig{
+					Attempts:  2,
+					Delay:     3 * time.Second,
+					MaxDelay:  2 * time.Second,
+					MaxJitter: 4 * time.Second,
+					DelayType: func(attempt uint, err error, config llm.DelayContext) time.Duration {
+						require.Equal(t, uint(1), attempt)
+						require.EqualError(t, err, "chat completions returned status 503")
+						require.Equal(t, 3*time.Second, config.Delay())
+						require.Equal(t, 2*time.Second, config.MaxDelay())
+						require.Equal(t, 4*time.Second, config.MaxJitter())
+						return time.Hour
+					},
+				}),
+				llm.WithHTTPClient(&http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+					if attempts.Add(1) == 1 {
+						return testHTTPResponse(http.StatusServiceUnavailable, ""), nil
+					}
+					return testHTTPResponse(http.StatusOK, "recovered"), nil
+				})}),
+			)
+			start := time.Now()
+
+			resp, err := client.Complete(t.Context(), llm.ChatRequest{})
+
+			require.NoError(t, err)
+			require.Equal(t, "recovered", resp.Choices[0].Message.Content)
+			require.Equal(t, 2*time.Second, time.Since(start))
+		})
+	})
+
+	t.Run("caller deadline stops retry delay", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			var attempts atomic.Int32
+			client := llm.NewClient("gpt-test",
+				llm.WithRetry(llm.RetryConfig{Attempts: 3, Delay: time.Hour, DelayType: llm.FixedDelay}),
+				llm.WithHTTPClient(&http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+					attempts.Add(1)
+					return testHTTPResponse(http.StatusServiceUnavailable, ""), nil
+				})}),
+			)
+			ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+			defer cancel()
+
+			_, err := client.Complete(ctx, llm.ChatRequest{})
+
+			require.ErrorIs(t, err, context.DeadlineExceeded)
+			require.Equal(t, int32(1), attempts.Load())
+		})
+	})
+
+	t.Run("request timeout is refreshed for each retry", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			var attempts atomic.Int32
+			client := llm.NewClient("gpt-test",
+				llm.WithRequestTimeout(time.Second),
+				llm.WithRetry(llm.RetryConfig{Attempts: 2, Delay: time.Nanosecond, DelayType: llm.FixedDelay}),
+				llm.WithHTTPClient(&http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+					deadline, ok := req.Context().Deadline()
+					require.True(t, ok)
+					require.Equal(t, time.Second, time.Until(deadline))
+					if attempts.Add(1) == 1 {
+						<-req.Context().Done()
+						return nil, req.Context().Err()
+					}
+					return testHTTPResponse(http.StatusOK, "recovered"), nil
+				})}),
+			)
+
+			resp, err := client.Complete(t.Context(), llm.ChatRequest{})
+
+			require.NoError(t, err)
+			require.Equal(t, "recovered", resp.Choices[0].Message.Content)
+			require.Equal(t, int32(2), attempts.Load())
+		})
 	})
 
 	t.Run("request timeout cancels one provider attempt", func(t *testing.T) {
@@ -618,6 +857,28 @@ func TestClient_Models(t *testing.T) {
 		require.EqualError(t, err, "models returned status 503: down")
 	})
 
+	t.Run("configured attempts recover from transient status errors", func(t *testing.T) {
+		var attempts atomic.Int32
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			if attempts.Add(1) == 1 {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				return
+			}
+			_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"recovered"}]}`))
+		}))
+		t.Cleanup(server.Close)
+		client := llm.NewClient("ignored",
+			llm.WithBaseURL(server.URL),
+			llm.WithRetry(llm.RetryConfig{Attempts: 2, Delay: time.Nanosecond, DelayType: llm.FixedDelay}),
+		)
+
+		resp, err := client.Models(t.Context())
+
+		require.NoError(t, err)
+		require.Equal(t, "recovered", resp.Data[0].ID)
+		require.Equal(t, int32(2), attempts.Load())
+	})
+
 	t.Run("request timeout", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			client := llm.NewClient("ignored",
@@ -776,4 +1037,14 @@ type errorOnCloseBody struct {
 
 func (b errorOnCloseBody) Close() error {
 	return b.err
+}
+
+type readErrorBody struct{}
+
+func (readErrorBody) Read([]byte) (int, error) {
+	return 0, errors.New("read failed")
+}
+
+func (readErrorBody) Close() error {
+	return nil
 }

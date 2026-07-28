@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"time"
 
 	"github.com/DavidNix/safeagent/go/llm"
 )
@@ -52,6 +53,44 @@ func ExampleClient_Complete() {
 	// Output:
 	// example-model: Say hello.
 	// Hello!
+}
+
+func ExampleClient_Complete_withRetry() {
+	attempts := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		attempts++
+		if attempts == 1 {
+			http.Error(w, "temporarily unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		writeJSON(w, llm.ChatResponse{
+			Choices: []llm.ChatChoice{{
+				Message:      llm.ChatMessage{Role: "assistant", Content: "Recovered"},
+				FinishReason: "stop",
+			}},
+		})
+	}))
+	defer server.Close()
+
+	client := llm.NewClient("example-model",
+		llm.WithBaseURL(server.URL),
+		llm.WithRetry(llm.RetryConfig{
+			Attempts:  2,
+			Delay:     time.Millisecond,
+			DelayType: llm.FixedDelay,
+		}),
+	)
+	response, err := client.Complete(context.Background(), llm.ChatRequest{})
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	fmt.Println(attempts)
+	fmt.Println(response.Choices[0].Message.Content)
+
+	// Output:
+	// 2
+	// Recovered
 }
 
 func ExampleStructuredOutput() {

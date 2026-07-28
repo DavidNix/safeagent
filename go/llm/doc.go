@@ -7,6 +7,10 @@
 // defaults while still accepting custom headers, query parameters, and body
 // fields.
 //
+// Retries are disabled by default. RetryConfig and WithRetry enable bounded,
+// context-aware retries for transient transport, response-read, and provider
+// status errors. Provider-specific constructors expose the same configuration.
+//
 // CircuitBreaker and EmbeddingCircuitBreaker add ordered provider failover.
 // They classify transport and provider errors, temporarily bypass an
 // unavailable primary, and periodically probe it for recovery.
